@@ -41,6 +41,7 @@ local PA_DEFAULTS = {
     spending = {},
     usage_drawn = {},
     usage_played = {},
+    income = {},
 }
 
 local function new_pa()
@@ -339,6 +340,112 @@ local function current_ante()
     return (G.GAME.round_resets and G.GAME.round_resets.ante) or 1
 end
 
+local function snapshot_ante()
+    local stats = RS.stats()
+    if not stats then return nil end
+    local blind = (stats.blinds or {})[stats.current_blind or 0]
+    if blind then return blind.ante end
+    local furthest = (((G.GAME or {}).round_scores or {}).furthest_ante or {}).amt or 0
+    return furthest > 0 and math.min(current_ante(), furthest) or nil
+end
+
+function RS.capture_snapshot()
+    local stats, ante = RS.stats(), snapshot_ante()
+    if not stats or not ante or (not G.playing_cards and not G.GAME.hands) then return end
+    local bucket = stats.per_ante[ante]
+    if not bucket then bucket = new_pa(); stats.per_ante[ante] = bucket end
+    if G.GAME.hands then
+        local levels = {}
+        for key, hand in pairs(G.GAME.hands) do
+            if type(hand.level) == 'number' then levels[key] = hand.level end
+        end
+        bucket.hand_levels = levels
+    end
+    if G.playing_cards then
+        local deck = { total = 0, suits = {}, ranks = {}, enhancements = {}, seals = {}, editions = {} }
+        for _, card in ipairs(G.playing_cards) do
+            local base, config = card.base or {}, card.config or {}
+            local center = config.center or {}
+            deck.total = deck.total + 1
+            bump(deck.suits, base.suit or 'Other', 1)
+            bump(deck.ranks, base.id and tostring(base.id) or 'Other', 1)
+            local enhanced = center.set == 'Enhanced' or (card.ability or {}).set == 'Enhanced'
+            bump(deck.enhancements, enhanced and (config.center_key or center.key or 'Enhanced') or 'Base', 1)
+            bump(deck.seals, card.seal or 'None', 1)
+            local edition = 'None'
+            if card.edition then
+                if type(card.edition.type) == 'string' then edition = card.edition.type
+                else
+                    local keys = {}
+                    for key, value in pairs(card.edition) do if value == true then keys[#keys + 1] = key end end
+                    table.sort(keys)
+                    edition = keys[1] or 'None'
+                end
+            end
+            bump(deck.editions, edition, 1)
+        end
+        bucket.deck_snapshot = deck
+    end
+end
+
+safe_wrap(_G, 'level_up_hand', function(ref)
+    return function(...)
+        local result = ref(...)
+        RS.capture_snapshot()
+        return result
+    end
+end)
+
+-- Collect the displayed payout components, then credit them only at cash-out.
+safe_wrap(G.FUNCS, 'evaluate_round', function(ref)
+    return function(...)
+        local stats = RS.stats()
+        if stats then stats.round_income = { ante = snapshot_ante() or current_ante(), categories = {} } end
+        local result = ref(...)
+        return result
+    end
+end)
+
+safe_wrap(_G, 'add_round_eval_row', function(ref)
+    return function(config, ...)
+        local stats = RS.stats()
+        local payout = stats and stats.round_income
+        if payout and config and type(config.dollars) == 'number' and config.dollars > 0 then
+            local category = ({blind1 = 'blinds', hands = 'hands', interest = 'interest'})[config.name]
+            if category then bump(payout.categories, category, config.dollars) end
+        end
+        return ref(config, ...)
+    end
+end)
+
+function RS.prepare_cashout_income()
+    local stats = RS.stats()
+    if stats then
+        RS._next_income = { stats = stats, payout = stats.round_income
+            or { ante = snapshot_ante() or current_ante(), categories = {} } }
+        stats.round_income = nil
+    end
+end
+
+function RS.record_income(category, amount)
+    if type(amount) ~= 'number' or amount <= 0 then return end
+    local bucket = RS.pa()
+    if bucket then bucket.income = bucket.income or {}; bump(bucket.income, category, amount) end
+end
+
+function RS.income_summary()
+    local totals, earned = {}, 0
+    for ante, bucket in pairs((RS.stats() or {}).per_ante or {}) do
+        if RS.in_slice(ante) then
+            earned = earned + (bucket.earned or 0)
+            for key, value in pairs(bucket.income or {}) do bump(totals, key, value) end
+        end
+    end
+    local known = (totals.blinds or 0) + (totals.hands or 0) + (totals.interest or 0) + (totals.sales or 0)
+    totals.other = math.max(0, earned - known)
+    return totals, earned
+end
+
 function RS.ante_in_progress(ante)
     local resets = G.GAME.round_resets or {}
     return ante == current_ante() and G.STATE ~= G.STATES.GAME_OVER
@@ -369,6 +476,7 @@ end
 
 safe_wrap(Blind, 'set_blind', function(ref)
     return function(self, blind, reset, ...)
+        if not reset then RS.capture_snapshot() end
         local result = ref(self, blind, reset, ...)
         if not reset and blind and blind.name and G.GAME.blind == self and RS.stats() then
             -- set_blind is called once at the start of each played blind.
@@ -376,6 +484,7 @@ safe_wrap(Blind, 'set_blind', function(ref)
             local previous = (s.blinds or {})[s.current_blind or 0]
             if previous then previous.completed = true end
             RS.blind_record(true)
+            RS.capture_snapshot()
         end
         return result
     end
@@ -383,6 +492,7 @@ end)
 
 safe_wrap(_G, 'end_round', function(ref)
     return function(...)
+        RS.capture_snapshot()
         local record = RS.blind_record(true)
         if record then
             local round = G.GAME.current_round
@@ -565,14 +675,28 @@ end)
 safe_wrap(_G, 'ease_dollars', function(ref)
     return function(mod, instant, ...)
         local s = RS.stats()
+        local pending = RS._next_income
+        RS._next_income = nil
         if s and type(mod) == 'number' and mod ~= 0 then
-            local pa = RS.pa() or new_pa()
+            local payout = pending and pending.stats == s and pending.payout
+            local pa
+            if mod > 0 and payout then
+                pa = s.per_ante[payout.ante]
+                if not pa then pa = new_pa(); s.per_ante[payout.ante] = pa end
+                local known = 0
+                for _, value in pairs(payout.categories) do known = known + value end
+                -- Unknown negative adjustments cannot be split reliably.
+                if known <= mod then
+                    pa.income = pa.income or {}
+                    for category, value in pairs(payout.categories) do bump(pa.income, category, value) end
+                end
+            else pa = RS.pa() or new_pa() end
             if mod < 0 then
                 s.money_spent = s.money_spent - mod
-                pa.spent = pa.spent - mod
+                pa.spent = (pa.spent or 0) - mod
             else
                 s.money_earned = s.money_earned + mod
-                pa.earned = pa.earned + mod
+                pa.earned = (pa.earned or 0) + mod
             end
         end
         return ref(mod, instant, ...)
@@ -865,6 +989,13 @@ function RSChart:draw()
     local horizontal = cfg.kind == 'horizontal'
     local stacked = cfg.kind == 'stacked'
     local left, right, top, bottom = horizontal and 1.45 or 0.58, 0.2, 0.32, 0.3
+    local legend_x, legend_rows = 0.08, 1
+    for _, ser in ipairs(series) do
+        local width = 0.2 + self.font.FONT:getWidth(ser.name) * (0.18 * self.font.FONTSCALE / G.TILESIZE)
+        if legend_x + width > w and legend_x > 0.08 then legend_x, legend_rows = 0.08, legend_rows + 1 end
+        legend_x = legend_x + width + 0.12
+    end
+    top = 0.17 + legend_rows * 0.15
     local pw, ph = w - left - right, h - top - bottom
     local function transform(v)
         return cfg.log and math.log10(math.max(0, v) + 1) or v
@@ -903,7 +1034,7 @@ function RSChart:draw()
         if math.abs(v) < 10 then return string.format('%.1f', v) end
         return number_format(math.floor(v + 0.5))
     end
-    -- Legend wraps to two lines if needed.
+    -- Reserve plot space for every wrapped legend row.
     local lx, ly = 0.08, 0.02
     for _, ser in ipairs(series) do
         local width = 0.2 + self.font.FONT:getWidth(ser.name) * (0.18 * self.font.FONTSCALE / G.TILESIZE)
@@ -920,7 +1051,7 @@ function RSChart:draw()
             local value = series[1].values[i] or 0
             local cy = top + (i - 1) * slot
             self:_text(tostring(label), 0.06, cy, math.min(0.19, slot * 1.05), {1, 1, 1, 0.85})
-            graphics.setColor(series[1].colour)
+            graphics.setColor((data.colours or {})[i] or series[1].colour)
             local width = value / maxv * (pw - 0.3)
             if value > 0 then graphics.rectangle('fill', left, cy + slot * 0.15, width, slot * 0.65) end
             self:_text(tostring(value), left + width + 0.06, cy, math.min(0.19, slot * 1.05), {1, 1, 1, 0.85})
@@ -1201,7 +1332,7 @@ function RS.rebuild_sliceview()
     v.most_money = localize('$') .. number_format(RS.pa_max('most_money'))
     local mph, mpc = most_played_hand()
     v.most_played = mph .. (mpc > 0 and (' (' .. mpc .. ')') or '')
-    v.earned = localize('$') .. number_format(RS.career_sliced('c_dollars_earned'))
+    v.earned = localize('$') .. number_format(RS.pa_sum('earned'))
     v.spent = localize('$') .. number_format(RS.pa_sum('spent'))
     v.hands_played = number_format(RS.career_sliced('c_hands_played'))
     v.cards_played = number_format(RS.career_sliced('c_cards_played'))
@@ -1553,6 +1684,175 @@ local function analysis_summary()
     } }
 end
 
+local INCOME_CATEGORIES = {
+    {key = 'blinds', label = 'Blinds'}, {key = 'hands', label = 'Unused hands'},
+    {key = 'interest', label = 'Interest'}, {key = 'sales', label = 'Sales'}, {key = 'other', label = 'Other'},
+}
+local DECK_MODES = { 'Suits', 'Ranks', 'Enhancements', 'Seals', 'Editions' }
+local DECK_FIELDS = { 'suits', 'ranks', 'enhancements', 'seals', 'editions' }
+RS._deck_mode, RS._level_hand = 1, 0
+
+local function category_colour(i)
+    return ({G.C.BLUE, G.C.GREEN, G.C.MONEY, G.C.PURPLE, G.C.ORANGE})[(i - 1) % 5 + 1]
+end
+
+function RS.income_chart_data()
+    local labels, series = {}, {}
+    for i, category in ipairs(INCOME_CATEGORIES) do
+        series[i] = series_of(category.label, category_colour(i), {})
+    end
+    for _, row in ipairs(pa_list()) do
+        if RS.in_slice(row.ante) then
+            labels[#labels + 1] = tostring(row.ante) .. (RS.ante_in_progress(row.ante) and '*' or '')
+            local income, known = row.bucket.income or {}, 0
+            for i = 1, 4 do
+                local amount = income[INCOME_CATEGORIES[i].key] or 0
+                series[i].values[#labels] = amount
+                known = known + amount
+            end
+            series[5].values[#labels] = math.max(0, (row.bucket.earned or 0) - known)
+        end
+    end
+    return {antes = labels, series = series, empty = 'Receive income to start tracking'}
+end
+
+function RS.level_hand_options()
+    local seen, options = {}, {}
+    for _, row in ipairs(pa_list()) do
+        for hand in pairs(row.bucket.hand_levels or {}) do
+            if not seen[hand] then seen[hand] = true; options[#options + 1] = hand end
+        end
+    end
+    table.sort(options)
+    return options
+end
+
+function RS.hand_levels_chart_data()
+    local options, usage, latest = RS.level_hand_options(), {}, {}
+    for _, row in ipairs(pa_list()) do
+        if RS.in_slice(row.ante) then
+            for hand, count in pairs(row.bucket.hand_types or {}) do bump(usage, hand, count) end
+            for hand, level in pairs(row.bucket.hand_levels or {}) do latest[hand] = level end
+        end
+    end
+    local chosen = options[RS._level_hand or 0]
+    if chosen then options = {chosen}
+    else
+        table.sort(options, function(a, b)
+            if (usage[a] or 0) ~= (usage[b] or 0) then return (usage[a] or 0) > (usage[b] or 0) end
+            if (latest[a] or 0) ~= (latest[b] or 0) then return (latest[a] or 0) > (latest[b] or 0) end
+            return a < b
+        end)
+        while #options > 3 do table.remove(options) end
+    end
+    local labels, series, any = {}, {}, false
+    for i, hand in ipairs(options) do series[i] = series_of(localize(hand, 'poker_hands'), category_colour(i), {}) end
+    for _, row in ipairs(pa_list()) do
+        if RS.in_slice(row.ante) then
+            labels[#labels + 1] = tostring(row.ante) .. (RS.ante_in_progress(row.ante) and '*' or '')
+            for i, hand in ipairs(options) do
+                local level = (row.bucket.hand_levels or {})[hand]
+                series[i].values[#labels] = level or false
+                if level ~= nil then any = true end
+            end
+        end
+    end
+    return {antes = any and labels or {}, series = series, empty = 'Hand levels appear after tracking starts'}
+end
+
+local function deck_label(key, field)
+    if field == 'ranks' then return RS.card_rank_label(tonumber(key) or key) end
+    if field == 'enhancements' and G.P_CENTERS and G.P_CENTERS[key] then
+        local center = G.P_CENTERS[key]
+        local ok, label = pcall(localize, {type = 'name_text', key = key, set = center.set})
+        if ok and type(label) == 'string' then return label end
+        return center.name or key
+    end
+    return key:gsub('^m_', ''):gsub('^e_', ''):gsub('^%l', string.upper)
+end
+
+local function deck_rows()
+    local rows = {}
+    for _, row in ipairs(pa_list()) do
+        if RS.in_slice(row.ante) and row.bucket.deck_snapshot then rows[#rows + 1] = row end
+    end
+    return rows
+end
+
+local function deck_keys(rows, field)
+    local totals, keys = {}, {}
+    for _, row in ipairs(rows) do
+        for key, count in pairs(row.bucket.deck_snapshot[field] or {}) do bump(totals, key, count) end
+    end
+    for key in pairs(totals) do keys[#keys + 1] = key end
+    table.sort(keys, function(a, b)
+        if totals[a] == totals[b] then
+            if field == 'ranks' and tonumber(a) and tonumber(b) then return tonumber(a) < tonumber(b) end
+            return a < b
+        end
+        return totals[a] > totals[b]
+    end)
+    return keys
+end
+
+function RS.deck_history_chart_data()
+    local rows = deck_rows()
+    local field = DECK_FIELDS[RS._deck_mode or 1]
+    local keys = deck_keys(rows, field)
+    local grouped = #keys > 4
+    while #keys > 4 do table.remove(keys) end
+    local labels, series = {}, {}
+    for i, key in ipairs(keys) do
+        series[i] = series_of(deck_label(key, field), CARD_SUIT_COLOURS[key] or category_colour(i), {})
+    end
+    if grouped then series[#series + 1] = series_of('Other types', category_colour(5), {}) end
+    for _, row in ipairs(rows) do
+        labels[#labels + 1] = tostring(row.ante) .. (RS.ante_in_progress(row.ante) and '*' or '')
+        local snapshot, shown = row.bucket.deck_snapshot, 0
+        for i, key in ipairs(keys) do
+            local count = (snapshot[field] or {})[key] or 0
+            series[i].values[#labels] = count
+            shown = shown + count
+        end
+        if grouped then series[#series].values[#labels] = math.max(0, snapshot.total - shown) end
+    end
+    return {antes = labels, series = series, empty = 'No deck snapshots in this ante range'}
+end
+
+function RS.deck_breakdown_chart_data()
+    local rows = deck_rows()
+    local last = rows[#rows]
+    local field = DECK_FIELDS[RS._deck_mode or 1]
+    local labels, values, colours = {}, {}, {}
+    if last then
+        local keys = deck_keys({last}, field)
+        if field == 'ranks' then table.sort(keys, function(a, b) return (tonumber(a) or 99) < (tonumber(b) or 99) end) end
+        for i, key in ipairs(keys) do
+            labels[i], values[i] = deck_label(key, field), last.bucket.deck_snapshot[field][key]
+            colours[i] = CARD_SUIT_COLOURS[key] or category_colour(i)
+        end
+    end
+    return {antes = labels, series = {series_of('Cards', G.C.BLUE, values)}, colours = colours,
+        ante = last and last.ante, total = last and last.bucket.deck_snapshot.total,
+        empty = 'No deck snapshots in this ante range'}
+end
+
+local function economy_grid()
+    return {n = G.UIT.R, config = {align = 'cm'}, nodes = {
+        chart_node('Income Sources by Ante', RS.income_chart_data, {w = 6.4, h = 3.2, kind = 'stacked'}),
+        chart_node('Poker-Hand Levels by Ante', RS.hand_levels_chart_data, {w = 6.4, h = 3.2, kind = 'line'}),
+    }}
+end
+
+local function deck_grid()
+    local latest = RS.deck_breakdown_chart_data()
+    local title = latest.ante and ('Latest Breakdown: Ante ' .. latest.ante .. ' (' .. latest.total .. ' cards)') or 'Deck Breakdown'
+    return {n = G.UIT.R, config = {align = 'cm'}, nodes = {
+        chart_node('Deck Composition by Ante', RS.deck_history_chart_data, {w = 6.4, h = 3.2, kind = 'stacked'}),
+        chart_node(title, RS.deck_breakdown_chart_data, {w = 6.4, h = 3.2, kind = 'horizontal'}),
+    }}
+end
+
 local function chart_grid()
     local function panel(title, data, kind, log)
         return chart_node(title, data, {w = 4.25, h = 2.1, kind = kind, log = log})
@@ -1797,9 +2097,23 @@ end
 
 RS._tab = 'stats'
 RS._trend_view = 'overview'
+local TREND_VIEWS = { 'overview', 'analysis', 'economy', 'deck' }
+local TREND_LABELS = { overview = 'Overview', analysis = 'Analysis', economy = 'Economy', deck = 'Deck' }
 
 G.FUNCS.runstats_trend_view = function()
-    RS._trend_view = RS._trend_view == 'analysis' and 'overview' or 'analysis'
+    local index = 1
+    for i, view in ipairs(TREND_VIEWS) do if RS._trend_view == view then index = i; break end end
+    RS._trend_view = TREND_VIEWS[index % #TREND_VIEWS + 1]
+    RS.show_menu()
+end
+
+G.FUNCS.runstats_level_hand = function()
+    RS._level_hand = ((RS._level_hand or 0) + 1) % (#RS.level_hand_options() + 1)
+    RS.show_menu()
+end
+
+G.FUNCS.runstats_deck_mode = function()
+    RS._deck_mode = (RS._deck_mode or 1) % #DECK_MODES + 1
     RS.show_menu()
 end
 
@@ -1834,9 +2148,26 @@ for _, screen in ipairs({ 'win', 'game_over' }) do
 end
 
 function RS.show_menu()
+    RS.capture_snapshot()
     G.FUNCS.overlay_menu{
         definition = create_UIBox_runstats(), config = { no_esc = RS._return_screen ~= nil },
     }
+end
+
+local function trend_controls()
+    local nodes = { UIBox_button{
+        label = { 'View: ' .. (TREND_LABELS[RS._trend_view] or 'Overview') },
+        button = 'runstats_trend_view', minw = 3, minh = 0.4, scale = 0.3, colour = G.C.BLUE, col = true,
+    } }
+    if RS._trend_view == 'economy' then
+        local hand = RS.level_hand_options()[RS._level_hand or 0]
+        nodes[#nodes + 1] = UIBox_button{label = { 'Hand: ' .. (hand and localize(hand, 'poker_hands') or 'Top 3') },
+            button = 'runstats_level_hand', minw = 3.4, minh = 0.4, scale = 0.3, colour = G.C.PURPLE, col = true}
+    elseif RS._trend_view == 'deck' then
+        nodes[#nodes + 1] = UIBox_button{label = { 'Group: ' .. DECK_MODES[RS._deck_mode or 1] },
+            button = 'runstats_deck_mode', minw = 3.4, minh = 0.4, scale = 0.3, colour = G.C.GREEN, col = true}
+    end
+    return {n = G.UIT.R, config = {align = 'cm', padding = 0.04}, nodes = nodes}
 end
 
 G.FUNCS.runstats_return_to_result = function()
@@ -1985,10 +2316,7 @@ function create_UIBox_runstats()
     local contents = { tabs_row(), ante_row() }
 
     if RS._tab == 'dashboard' then
-        contents[#contents + 1] = UIBox_button{
-            label = { 'View: ' .. (RS._trend_view == 'analysis' and 'Analysis' or 'Overview') },
-            button = 'runstats_trend_view', minw = 3, minh = 0.4, scale = 0.3, colour = G.C.BLUE,
-        }
+        contents[#contents + 1] = trend_controls()
         contents[#contents + 1] = kpi_row()
         if RS._trend_view == 'analysis' then
             contents[#contents + 1] = analysis_summary()
@@ -1997,6 +2325,25 @@ function create_UIBox_runstats()
                 { n = G.UIT.T, config = { text = 'Score metrics use tracked hands. Other / Earlier includes unclassified money losses.',
                     scale = 0.23, colour = G.C.UI.TEXT_LIGHT, shadow = true } },
             } }
+        elseif RS._trend_view == 'economy' then
+            local income, earned = RS.income_summary()
+            contents[#contents + 1] = economy_grid()
+            contents[#contents + 1] = {n = G.UIT.R, config = {align = 'cm', padding = 0.04}, nodes = {
+                {n = G.UIT.T, config = {text = 'Earned: ' .. localize('$') .. number_format(earned)
+                    .. '   Interest: ' .. localize('$') .. number_format(income.interest or 0)
+                    .. '   Sales: ' .. localize('$') .. number_format(income.sales or 0),
+                    scale = 0.27, colour = G.C.UI.TEXT_LIGHT, shadow = true}},
+            }}
+            contents[#contents + 1] = {n = G.UIT.R, config = {align = 'cm', padding = 0.04}, nodes = {
+                {n = G.UIT.T, config = {text = 'Other includes unclassified/earlier income. Levels show latest per-ante snapshots; missing history is blank.',
+                    scale = 0.21, colour = G.C.UI.TEXT_LIGHT, shadow = true}},
+            }}
+        elseif RS._trend_view == 'deck' then
+            contents[#contents + 1] = deck_grid()
+            contents[#contents + 1] = {n = G.UIT.R, config = {align = 'cm', padding = 0.04}, nodes = {
+                {n = G.UIT.T, config = {text = 'Latest snapshot per ante. Suits/ranks use base identities. History groups rarer categories under Other types.',
+                    scale = 0.21, colour = G.C.UI.TEXT_LIGHT, shadow = true}},
+            }}
         else
             local charts = chart_grid()
             contents[#contents + 1] = summary_line()
@@ -2004,7 +2351,9 @@ function create_UIBox_runstats()
             contents[#contents + 1] = charts[2]
         end
         contents[#contents + 1] = { n = G.UIT.R, config = { align = 'cm', padding = 0.02 }, nodes = {
-            { n = G.UIT.T, config = { text = 'Blind labels: ante + S / B / BOSS. * In progress / partial history. New history starts when tracked.',
+            { n = G.UIT.T, config = { text = RS._trend_view == 'overview'
+                    and 'Blind labels: ante + S / B / BOSS. * In progress / partial history. New history starts when tracked.'
+                    or '* In progress. New history starts when tracked.',
                 scale = 0.19, colour = G.C.UI.TEXT_DARK, shadow = true } },
         } }
     elseif RS._tab == 'probabilities' then

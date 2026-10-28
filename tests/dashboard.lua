@@ -59,6 +59,11 @@ function create_UIBox_game_over() return create_UIBox_generic_options({result = 
 function end_round() end
 function set_hand_usage() end
 function check_and_set_high_score() end
+function ease_dollars(amount) G.GAME.dollars = G.GAME.dollars + amount end
+function add_round_eval_row(config) return config.name end
+function level_up_hand(card, hand, instant, amount)
+    G.GAME.hands[hand].level = math.max(0, G.GAME.hands[hand].level + (amount or 1))
+end
 G = {
     STAGE = 1, STAGES = {RUN = 1, MAIN_MENU = 2}, STATES = {SHOP = 5, GAME_OVER = 9}, STATE = 2,
     FUNCS = {
@@ -68,6 +73,9 @@ G = {
             if card.ability.set == 'Booster' then card:open() end
         end,
         evaluate_play = function() end,
+        evaluate_round = function()
+            for _, config in ipairs(G.test_round_rows or {}) do add_round_eval_row(config) end
+        end,
     },
     UIT = {R = 'R', C = 'C', T = 'T', O = 'O'},
     TILESIZE = 1,
@@ -420,6 +428,10 @@ charts = {}; walk(G.last_overlay)
 assert(#charts == 2 and charts[1].config.kind == 'line' and charts[2].config.kind == 'horizontal')
 for _, chart in ipairs(charts) do chart:draw() end
 G.FUNCS.runstats_trend_view()
+assert(RS._trend_view == 'economy')
+G.FUNCS.runstats_trend_view()
+assert(RS._trend_view == 'deck')
+G.FUNCS.runstats_trend_view()
 charts = {}; walk(G.last_overlay)
 assert(RS._trend_view == 'overview' and #charts == 6)
 -- Use rate measures draws eventually played once, with matched sample coverage.
@@ -634,9 +646,135 @@ s = fresh()
 RS._ante_sel = 12
 G.FUNCS.runstats_open()
 assert(RS._ante_sel == 0 and RS.max_ante() == 0)
+-- Income categories are earned at payout time, with the source blind's ante.
+s = fresh()
+start('Boss', 600); win(1, 3)
+G.GAME.round_resets.ante = 2
+G.test_round_rows = {
+    {name = 'blind1', dollars = 5}, {name = 'hands', dollars = 3},
+    {name = 'interest', dollars = 4}, {name = 'joker1', dollars = 2},
+    {name = 'discards', dollars = 1}, {name = 'bottom', dollars = 15},
+}
+G.FUNCS.evaluate_round()
+local income, earned = RS.income_summary()
+assert(earned == 0 and not income.interest, 'unclaimed rewards are not income')
+assert(s.round_income.ante == 1)
+RS.prepare_cashout_income(); ease_dollars(15)
+income, earned = RS.income_summary()
+assert(earned == 15 and income.blinds == 5 and income.hands == 3 and income.interest == 4 and income.other == 3)
+assert(s.per_ante[1].earned == 15 and s.per_ante[2] == nil, 'boss payout is credited to the blind ante')
+ease_dollars(7); RS.record_income('sales', 7)
+ease_dollars(3)
+RS.record_income('sales', 0); RS.record_income('sales', -2)
+income, earned = RS.income_summary()
+assert(earned == 25 and income.sales == 7 and income.other == 6)
+local income_data = RS.income_chart_data()
+for index, ante in ipairs({1, 2}) do
+    local sum = 0
+    for _, series in ipairs(income_data.series) do sum = sum + series.values[index] end
+    assert(sum == s.per_ante[ante].earned)
+end
+RS._ante_sel = 1
+income, earned = RS.income_summary()
+assert(earned == 15 and not income.sales)
+RS._ante_sel = 0
+local old_stats = s
+G.FUNCS.evaluate_round(); RS.prepare_cashout_income()
+s = fresh(); ease_dollars(2)
+assert(RS.income_summary().blinds == nil and s.money_earned == 2, 'pending income cannot leak into a different run')
+assert(old_stats.money_earned == 25)
+s = fresh()
+s.round_income = {ante = 1, categories = {blinds = 5, hands = 3, interest = 4}}
+RS.prepare_cashout_income(); ease_dollars(5)
+income, earned = RS.income_summary()
+assert(earned == 5 and not income.blinds and income.other == 5, 'adjusted net payouts must not fabricate a split')
+s.per_ante[2] = {earned = 40, career = {}}
+RS._ante_sel = 2
+assert(RS.income_summary().other == 40, 'legacy income remains visible without fabricated categories')
+-- Per-ante snapshots retain real deck traits and every poker hand's level.
+s = fresh()
+G.GAME.hands = {Pair = {level = 1}, Flush = {level = 1}, ['High Card'] = {level = 1}, Straight = {level = 1}}
+G.playing_cards = {
+    {base = {suit = 'Hearts', id = 2}},
+    {base = {suit = 'Spades', id = 14}, config = {center = {key = 'm_glass', set = 'Enhanced'}}, seal = 'Red', edition = {foil = true}},
+    {base = {suit = 'Hearts', id = 14}, config = {center = {key = 'm_steel', set = 'Enhanced'}}, seal = 'Blue', edition = {type = 'holo'}},
+    {base = {suit = 'Diamonds', id = 13}, config = {center = {key = 'm_gold', set = 'Enhanced'}}, seal = 'Gold', edition = {polychrome = true}},
+    {base = {suit = 'Clubs', id = 5}, seal = 'Purple', edition = {negative = true}},
+    {base = {suit = 'Other', id = 10}, config = {center = {key = 'm_stone', set = 'Enhanced'}}},
+}
+RS.capture_snapshot()
+assert(next(s.per_ante) == nil, 'snapshots must not unlock an unplayed ante')
+start('Boss', 600)
+local deck = s.per_ante[1].deck_snapshot
+assert(deck.total == 6 and deck.suits.Hearts == 2 and deck.ranks['14'] == 2)
+assert(deck.enhancements.Base == 2 and deck.enhancements.m_glass == 1 and deck.seals.None == 2)
+assert(deck.editions.None == 2 and deck.editions.foil == 1 and deck.editions.holo == 1)
+level_up_hand(nil, 'Pair', true, 1)
+level_up_hand(nil, 'Flush', true, -1)
+assert(s.per_ante[1].hand_levels.Pair == 2 and s.per_ante[1].hand_levels.Flush == 0)
+win(1, 3)
+G.GAME.round_resets.ante = 2
+level_up_hand(nil, 'Pair', true, 2) -- shop after boss, before next played ante
+assert(s.per_ante[1].hand_levels.Pair == 4 and not s.per_ante[2])
+start('Small', 800)
+level_up_hand(nil, 'Pair', true, 1)
+table.insert(G.playing_cards, {base = {suit = 'Clubs', id = 3}, seal = 'Red'})
+RS.capture_snapshot()
+assert(s.per_ante[1].hand_levels.Pair == 4 and s.per_ante[2].hand_levels.Pair == 5)
+assert(s.per_ante[1].deck_snapshot.total == 6 and s.per_ante[2].deck_snapshot.total == 7)
+s.per_ante[1].hand_types = {Pair = 10, Flush = 4, ['High Card'] = 3, Straight = 1}
+RS._level_hand = 0
+local levels = RS.hand_levels_chart_data()
+assert(#levels.series == 3 and levels.series[1].name == 'Pair' and levels.series[1].values[1] == 4 and levels.series[1].values[2] == 5)
+local options = RS.level_hand_options()
+for index, hand in ipairs(options) do if hand == 'Flush' then RS._level_hand = index end end
+levels = RS.hand_levels_chart_data()
+assert(#levels.series == 1 and levels.series[1].values[1] == 0, 'level zero is a real value, not missing data')
+for mode = 1, 5 do
+    RS._deck_mode = mode
+    local history, breakdown = RS.deck_history_chart_data(), RS.deck_breakdown_chart_data()
+    assert(#history.series <= 5 and breakdown.ante == 2 and breakdown.total == 7)
+    for index, total in ipairs({6, 7}) do
+        local sum = 0
+        for _, series in ipairs(history.series) do sum = sum + series.values[index] end
+        assert(sum == total, 'grouping must preserve every card')
+    end
+    local sum = 0
+    for _, count in ipairs(breakdown.series[1].values) do sum = sum + count end
+    assert(sum == 7)
+end
+RS._ante_sel = 1
+assert(RS.deck_breakdown_chart_data().ante == 1 and RS.deck_breakdown_chart_data().total == 6)
+assert(RS.hand_levels_chart_data().series[1].values[1] == 0)
+RS._ante_sel = 0
+G.GAME.run_stats = copy(s); s = G.GAME.run_stats
+assert(s.per_ante[1].deck_snapshot.total == 6 and s.per_ante[2].hand_levels.Pair == 5, 'snapshots survive save/load')
+-- Missing historical snapshots stay missing.
+s.per_ante[3] = {career = {}, earned = 10}
+RS._ante_sel = 3
+assert(#RS.deck_history_chart_data().antes == 0 and #RS.deck_breakdown_chart_data().antes == 0)
+assert(#RS.hand_levels_chart_data().antes == 0)
+RS._ante_sel = 0
+RS._trend_view = 'economy'; G.FUNCS.runstats_tab_dash()
+charts, buttons = {}, {}; walk(G.last_overlay)
+assert(#charts == 2 and buttons.runstats_level_hand)
+for _, chart in ipairs(charts) do chart:draw() end
+G.FUNCS.runstats_level_hand()
+G.FUNCS.runstats_trend_view()
+charts, buttons = {}, {}; walk(G.last_overlay)
+assert(RS._trend_view == 'deck' and #charts == 2 and buttons.runstats_deck_mode)
+for mode = 1, 5 do
+    G.FUNCS.runstats_deck_mode()
+    charts = {}; walk(G.last_overlay)
+    for _, chart in ipairs(charts) do chart:draw() end
+end
+G.FUNCS.runstats_trend_view()
+assert(RS._trend_view == 'overview')
 print('Dashboard checks passed: hooks, saves, filtering, menus, six charts and draw paths')
 print('Pack and result-screen checks passed: all five families/sizes, free packs, old saves, win/loss navigation')
 print('Drawn-card checks passed: completed transfers, repeated draws, exclusions, filters, mode cycle and old saves')
 print('Analysis checks passed: score samples/median, spending totals/categories, Trends views, matched use rates and save/load')
 if not vanilla_mode then print('Probability checks passed: real tooltip helper, zero/multiple/debuffed Oops, selling, history, raw ratios and no_mod rolls') end
 print('Ante selector checks passed: empty runs, played limit, future shop exclusion, endless antes, gaps and stale selections')
+
+print('Economy/deck checks passed: claimed income, ante attribution, snapshots, levels, all deck groupings, save/load, filters and rendering')

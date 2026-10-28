@@ -70,6 +70,23 @@ local values, total = RS.spending_summary()
 assert(total == 26 and values.jokers == 7 and values.rerolls == 4 and values.packs == 5 and values.vouchers == 10 and values.other == 0)
 print('Lovely patch checks passed: vanilla and installed source targets, Lua compilation and exact charge payloads')
 """
+income_patches = [p for p in patches if 'prepare_cashout_income' in p['payload'] or 'record_income' in p['payload']]
+script += """
+G.GAME.run_stats = RS.fresh_stats()
+G.GAME.round_resets.ante = 1
+local bucket = RS.pa()
+G.GAME.run_stats.round_income = {ante = 1, categories = {blinds = 5, hands = 2, interest = 3}}
+"""
+for patch in income_patches:
+    if 'prepare_cashout_income' in patch['payload']:
+        script += patch['payload'] + "\nease_dollars(12)\n"
+    else:
+        script += "do local self = {sell_cost = 7}; ease_dollars(self.sell_cost); " + patch['payload'] + " end\n"
+script += """
+local income, total = RS.income_summary()
+assert(total == 19 and income.blinds == 5 and income.hands == 2 and income.interest == 3 and income.sales == 7 and income.other == 2)
+print('Income patch checks passed: actual cash-out preparation and sale-credit payloads')
+"""
 bootstrap = next(p['payload'] for p in patches if 'runstats.runtime' in p['payload'])
 script += f"local boot = assert(loadstring({json.dumps(bootstrap)}))\n"
 script += """

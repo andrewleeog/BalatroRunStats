@@ -15,7 +15,11 @@ Open **Run Stats** from the pause menu or the win/game-over screen. After viewin
 ## Pages
 
 - **Summary:** records, run totals, purchases, all five booster pack families, and average/median hand scores.
-- **Trends:** scoring versus blind targets, hands needed to win, earnings/spending, shop cash reserves, poker hands, and consumable use. Switch **View: Overview** to **Analysis** for score consistency and spending categories.
+- **Trends:** use the View button to cycle through four views:
+  - **Overview:** scoring versus blind targets, hands needed to win, earnings/spending, shop cash reserves, poker hands, and consumable use.
+  - **Analysis:** score consistency and spending categories.
+  - **Economy:** income sources by ante and poker-hand level progression. The Hand button cycles between the top three used hands and individual hands.
+  - **Deck:** composition history and a detailed breakdown of the latest snapshot in the selected ante range. The Group button cycles through suits, ranks, enhancements, seals, and editions. History shows the four most common categories plus Other types; the detail chart shows all categories.
 - **Prob:** observed hits/rolls alongside current listed probabilities. Listed probabilities reflect Oops! All Sixes and use the same calculation as card tooltips.
 - **Cards:** rank/suit charts with Played, Discarded, Drawn, and Use rate modes.
 
@@ -26,6 +30,10 @@ The shared ante selector offers played antes, skips gaps, and supports endless r
 Stats are saved with the run. The mod does not keep a separate archive after you leave the result screen or start another run.
 
 New metrics begin recording when the relevant mod version is installed. Missing historical data is not reconstructed. Unclassified spending and older pack totals appear under **Other / Earlier**.
+
+Income separates blind rewards, unused-hand rewards, interest, sales, and Other. Payout components are credited when cash-out is claimed, to the ante of the blind that earned them. Other includes joker/tag bonuses, discard rewards, unclassified income, and older income without a recorded source. Adjusted payouts that cannot be split reliably are also kept under Other.
+
+Deck composition and hand levels keep the latest observed snapshot for each played ante, refreshed at blind transitions, after hand-level changes, and when opening stats. The Deck detail chart shows the latest snapshot within the selected range. Suit and rank counts use base card identities, including the base identity of enhanced cards.
 
 **Use rate** measures the share of tracked deck-to-hand draws that were later played at least once. Replaying a card without drawing it again does not increase that rate. A new draw of the same card counts as a new opportunity. Blank bars mean there were no tracked draws for that rank/suit.
 

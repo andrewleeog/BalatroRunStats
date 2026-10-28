@@ -2,8 +2,8 @@
   "id": "RunStats",
   "name": "Run Stats",
   "author": ["andrewleeog"],
-  "description": "Tracks run statistics, booster packs, probability hit rates, card use rates, hand-score consistency, spending categories and blind history. View Summary and Trends from the pause menu or the win and game-over screens.",
+  "description": "Tracks run statistics, income and spending sources, poker-hand levels, deck composition, booster packs, card use rates, probability hit rates and blind history. Requires Lovely; Steamodded is optional.",
   "prefix": "rs",
-  "version": "1.3.0",
+  "version": "1.4.0",
   "main_file": "BalatroRunStats.lua"
 }

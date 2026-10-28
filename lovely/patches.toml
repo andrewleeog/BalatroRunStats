@@ -63,3 +63,21 @@ position = "after"
 match_indent = true
 times = 2
 payload = "if RunStats then RunStats.record_spend(RunStats.purchase_category(self), self.cost) end"
+
+# Identify the actual aggregate payout before ease_dollars receives it.
+[[patches]]
+[patches.pattern]
+target = "functions/button_callbacks.lua"
+pattern = "ease_dollars(G.GAME.current_round.dollars)"
+position = "before"
+match_indent = true
+payload = "if RunStats then RunStats.prepare_cashout_income() end"
+
+# Sales count only when the sale proceeds are actually paid.
+[[patches]]
+[patches.pattern]
+target = "card.lua"
+pattern = "ease_dollars(self.sell_cost)"
+position = "after"
+match_indent = true
+payload = "if RunStats then RunStats.record_income('sales', self.sell_cost) end"
