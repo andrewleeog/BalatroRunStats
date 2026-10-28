@@ -1,0 +1,9 @@
+{
+  "id": "RunStats",
+  "name": "Run Stats",
+  "author": ["andrewleeog"],
+  "description": "Tracks run statistics, booster packs, probability hit rates, card use rates, hand-score consistency, spending categories and blind history. View Summary and Trends from the pause menu or the win and game-over screens.",
+  "prefix": "rs",
+  "version": "1.2.2",
+  "main_file": "BalatroRunStats.lua"
+}
