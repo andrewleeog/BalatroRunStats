@@ -3,6 +3,22 @@ version = "1.0.0"
 dump_lua = true
 priority = 0
 
+# Lovely preloads this module; vanilla loads it after the game's APIs are ready.
+# When Steamodded is installed it loads manifest.json's main_file instead.
+[[patches]]
+[patches.module]
+source = "BalatroRunStats.lua"
+before = "main.lua"
+name = "runstats.runtime"
+
+[[patches]]
+[patches.pattern]
+target = "game.lua"
+pattern = "boot_timer('prep stage', 'splash prep',1)"
+position = "before"
+match_indent = true
+payload = "if not SMODS then require('runstats.runtime') end"
+
 # Add the Run Stats button definition to the pause (options) menu
 [[patches]]
 [patches.pattern]

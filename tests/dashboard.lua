@@ -1,5 +1,8 @@
 -- Run from the mod directory: luajit tests/dashboard.lua
 local function noop() end
+local vanilla_mode = os.getenv('RUNSTATS_TEST_MODE') == 'vanilla'
+local random_calls, random_value = 0, 0.25
+function pseudorandom(seed, min, max) random_calls = random_calls + 1; return random_value end
 Game = {
     init_game_object = function() return {} end,
     update_shop = function() G.STATE_COMPLETE = true; G.shop = {} end,
@@ -28,7 +31,8 @@ Blind = {
     end,
     get_type = function(self) return self.kind end,
 }
-SMODS = {pseudorandom_probability = function() return true end}
+if vanilla_mode then SMODS = nil
+else SMODS = {pseudorandom_probability = function(_, seed) return pseudorandom(seed) < 1 end} end
 Moveable = {}
 function Moveable:extend()
     local class = setmetatable({}, {__index = self})
@@ -460,6 +464,57 @@ assert(RS._card_mode == 4)
 s.per_ante[2].cards_drawn['Spades:14'] = 100
 s.per_ante[2].cards_played = {['Spades:14'] = 100}
 assert(RS.card_chart_data().values[1][1] == false)
+if vanilla_mode then
+    assert(SMODS == nil, 'standalone mode must not create a fake SMODS namespace')
+    s = fresh()
+    G.jokers, G.playing_cards = {cards = {}}, {}
+    G.GAME.probabilities = {normal = 1}
+    local before = random_calls
+    random_value = 0.25
+    assert(pseudorandom('space') == 0.25 and random_calls == before + 1)
+    assert(s.probs.space.rolls == 1 and s.probs.space.hits == 0, 'use strict vanilla comparison at the threshold')
+    random_value = 0.1
+    assert(pseudorandom('space') == 0.1 and s.probs.space.hits == 1)
+    local denominators = {bloodstone = 2, ['8ball'] = 4, lucky_mult = 5, lucky_money = 15,
+        business = 2, wheel_of_fortune = 4, gros_michel = 6, cavendish = 1000, parking = 2, halu9 = 2, glass = 4}
+    for seed, denominator in pairs(denominators) do
+        before = random_calls
+        assert(pseudorandom(seed) == 0.1 and random_calls == before + 1)
+        assert(s.probs[seed].rolls == 1 and s.probs[seed].hits == (0.1 < 1 / denominator and 1 or 0))
+    end
+    pseudorandom('unrelated'); pseudorandom('space', 1, 10)
+    assert(not s.probs.unrelated and s.probs.space.rolls == 2, 'ignore unrelated/ranged random calls')
+    for _, normal in ipairs({1, 2, 4, 8, 1}) do
+        G.GAME.probabilities.normal = normal
+        before = random_calls
+        RS.rebuild_probview()
+        assert(RS._probview.p_bloodstone_odds == normal .. ' in 2')
+        assert(RS._probview.p_space_odds == normal .. ' in 4')
+        assert(RS._probview.p_halu_odds == normal .. ' in 2')
+        assert(random_calls == before, 'viewing probabilities must not advance RNG')
+    end
+    G.jokers.cards = {{config = {center_key = 'j_space'}, ability = {extra = 10}}}
+    random_value = 0.25
+    G.GAME.probabilities.normal = 1
+    pseudorandom('space')
+    assert(s.probs.space.den == 10 and s.probs.space.hits == 1)
+    G.GAME.probabilities.normal = 4
+    pseudorandom('space')
+    RS.rebuild_probview()
+    assert(s.probs.space.hits == 2 and RS._probview.p_space_odds == '4 in 10')
+    assert(s.per_ante[1].probs.space.rolls == 4)
+    RS._ante_sel = 2
+    RS.rebuild_probview()
+    assert(RS._probview.p_space_odds == '4 in 10' and RS._probview.p_space == '0/0 (--)')
+    RS._ante_sel = 0
+    -- Lovely's module and the manifest entry must never wrap hooks twice.
+    local init, rng = Game.init_game_object, pseudorandom
+    package.preload['runstats.runtime'] = assert(loadfile('BalatroRunStats.lua'))
+    assert(require('runstats.runtime') == RS)
+    assert(dofile('BalatroRunStats.lua') == RS)
+    assert(Game.init_game_object == init and pseudorandom == rng)
+    print('Vanilla checks passed: no SMODS, all built-in probabilities, exact RNG preservation, Oops stacking and single initialization')
+else
 -- Exercise the real Steamodded tooltip probability helper with Oops contexts.
 local smods_dir = os.getenv('SMODS_DIR') or '../smods-stable'
 local utils = assert(io.open(smods_dir .. '/src/utils.lua', 'r'))
@@ -528,6 +583,8 @@ SMODS.get_probability_vars = nil
 RS.rebuild_probview()
 assert(RS._probview.p_bloodstone_odds == '2 in 2' and RS._probview.p_custom_odds == '2 in 3')
 SMODS.get_probability_vars = real_helper
+assert(s.probs.custom.rolls == 1 and s.probs.custom_modified.rolls == 1, 'SMODS rolls must not also enter the vanilla tracker')
+end
 s = fresh()
 RS._tab = 'stats'
 assert(RS.max_ante() == 0 and #RS.played_antes() == 0)
@@ -581,5 +638,5 @@ print('Dashboard checks passed: hooks, saves, filtering, menus, six charts and d
 print('Pack and result-screen checks passed: all five families/sizes, free packs, old saves, win/loss navigation')
 print('Drawn-card checks passed: completed transfers, repeated draws, exclusions, filters, mode cycle and old saves')
 print('Analysis checks passed: score samples/median, spending totals/categories, Trends views, matched use rates and save/load')
-print('Probability checks passed: real tooltip helper, zero/multiple/debuffed Oops, selling, history, raw ratios and no_mod rolls')
+if not vanilla_mode then print('Probability checks passed: real tooltip helper, zero/multiple/debuffed Oops, selling, history, raw ratios and no_mod rolls') end
 print('Ante selector checks passed: empty runs, played limit, future shop exclusion, endless antes, gaps and stale selections')

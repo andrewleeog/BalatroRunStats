@@ -8,7 +8,11 @@ import tempfile
 import tomllib
 
 root = Path(__file__).resolve().parents[1]
-patches = [entry['pattern'] for entry in tomllib.loads((root / 'lovely/patches.toml').read_text())['patches']]
+entries = tomllib.loads((root / 'lovely/patches.toml').read_text())['patches']
+patches = [entry['pattern'] for entry in entries if 'pattern' in entry]
+modules = [entry['module'] for entry in entries if 'module' in entry]
+assert len(modules) == 1 and modules[0]['name'] == 'runstats.runtime' and modules[0]['before'] == 'main.lua'
+assert (root / modules[0]['source']).is_file()
 mods = Path(os.environ.get('BALATRO_MODS_DIR', str(Path.home() / '.local/share/Steam/steamapps/compatdata/2379780/pfx/drive_c/users/steamuser/AppData/Roaming/Balatro/Mods')))
 dump = mods / 'lovely/dump'
 game_src = Path(os.environ.get('BALATRO_GAME_SRC', str(root.parent / 'game-src')))
@@ -19,7 +23,7 @@ with tempfile.TemporaryDirectory(prefix='runstats-patches-') as temp:
             continue
         targets = {}
         for patch in patches:
-            if label == 'installed-mods' and 'record_spend' not in patch['payload']:
+            if label == 'installed-mods' and 'run_stats_button' in patch['payload']:
                 continue  # pause-menu patches are already present in the dump
             target = patch['target']
             text = targets.get(target, (source / target).read_text())
@@ -28,6 +32,8 @@ with tempfile.TemporaryDirectory(prefix='runstats-patches-') as temp:
             assert len(matches) == patch.get('times', 1), (label, target, patch['pattern'], len(matches))
             def replace(match):
                 payload = '\n'.join(match['indent'] + line for line in patch['payload'].splitlines())
+                if patch['position'] == 'before':
+                    return payload + '\n' + match[0]
                 assert patch['position'] == 'after'
                 return match[0] + '\n' + payload
             targets[target] = pattern.sub(replace, text)
@@ -63,5 +69,16 @@ script += """
 local values, total = RS.spending_summary()
 assert(total == 26 and values.jokers == 7 and values.rerolls == 4 and values.packs == 5 and values.vouchers == 10 and values.other == 0)
 print('Lovely patch checks passed: vanilla and installed source targets, Lua compilation and exact charge payloads')
+"""
+bootstrap = next(p['payload'] for p in patches if 'runstats.runtime' in p['payload'])
+script += f"local boot = assert(loadstring({json.dumps(bootstrap)}))\n"
+script += """
+local calls = 0
+local loader = function(name) assert(name == 'runstats.runtime'); calls = calls + 1 end
+setfenv(boot, {require = loader})()
+assert(calls == 1, 'Lovely must load the mod when Steamodded is absent')
+setfenv(boot, {SMODS = {}, require = loader})()
+assert(calls == 1, 'Steamodded owns initialization when installed')
+print('Lovely bootstrap checks passed: standalone module loading and Steamodded coexistence')
 """
 subprocess.run(['luajit', '-'], input=script, text=True, check=True, cwd=root)

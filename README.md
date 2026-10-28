@@ -4,7 +4,7 @@ A Balatro mod by **andrewleeog** for tracking the current run, with summaries, c
 
 ## Installation
 
-Requires [Lovely](https://github.com/ethangreen-dev/lovely-injector) and [Steamodded](https://github.com/Steamodded/smods).
+Requires [Lovely](https://github.com/ethangreen-dev/lovely-injector). [Steamodded](https://github.com/Steamodded/smods) is optional.
 
 1. Download `BalatroRunStats.zip` from the [latest release](https://github.com/andrewleeog/BalatroRunStats/releases/latest), or clone this repository.
 2. Place the repository's contents in a `BalatroRunStats` folder inside your Balatro `Mods` directory. `manifest.json`, `BalatroRunStats.lua`, and `lovely/` should be directly inside that folder.
@@ -29,9 +29,18 @@ New metrics begin recording when the relevant mod version is installed. Missing 
 
 **Use rate** measures the share of tracked deck-to-hand draws that were later played at least once. Replaying a card without drawing it again does not increase that rate. A new draw of the same card counts as a new opportunity. Blank bars mean there were no tracked draws for that rank/suit.
 
+Without Steamodded, Lovely loads the mod directly and the probability tracker observes Balatro's existing rolls for its built-in chance effects. It does not generate extra random samples. When Steamodded is installed, the mod uses its probability API instead, including supported modded effects. Both paths reflect Oops! All Sixes and preserve existing run-stat saves.
+
 ## Development checks
 
-Requires LuaJIT, Python 3.11+, and a Steamodded source checkout. Run commands from this repository's root:
+Requires LuaJIT and Python 3.11+. Run the standalone suite from this repository's root:
+
+```sh
+RUNSTATS_TEST_MODE=vanilla luajit tests/dashboard.lua
+RUNSTATS_TEST_MODE=vanilla python3 tests/check_patches.py
+```
+
+For Steamodded integration checks, also provide a Steamodded source checkout:
 
 ```sh
 SMODS_DIR=/path/to/smods luajit tests/dashboard.lua

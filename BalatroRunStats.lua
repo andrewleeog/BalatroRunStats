@@ -1,6 +1,6 @@
 -- =============================================================
 -- Run Stats — native-style stats menu + per-ante dashboard
--- Steamodded mod. All tracking is per-run; persists with the run save.
+-- Lovely mod with optional Steamodded integration. Stats persist with the run.
 --
 -- Tabs:
 --   Summary   — emulates the vanilla high-scores/stats menu, but every
@@ -11,6 +11,8 @@
 RunStats = RunStats or {}
 
 local RS = RunStats
+if RS._loaded then return RS end
+RS._loaded = true
 
 -- ------------------------------------------------------------
 -- Stats storage
@@ -267,6 +269,7 @@ function RS.rebuild_kpis()
 end
 
 local function safe_wrap(obj, key, make_new)
+    if not obj then return end
     local ref = obj[key]
     if ref == nil then return end
     obj[key] = make_new(ref)
@@ -454,8 +457,8 @@ safe_wrap(_G, 'inc_career_stat', function(ref)
     end
 end)
 
--- Universal probability tracker: EVERY chance roll in the game (vanilla and
--- modded) flows through SMODS.pseudorandom_probability, keyed by its seed —
+-- Steamodded probability tracking uses its API for vanilla and modded rolls,
+-- keyed by seed. The standalone observer below handles vanilla comparisons.
 -- 'space' (Space Joker), 'bloodstone', '8ball', 'glass', 'lucky_mult',
 -- 'lucky_money', 'business', 'wheel_of_fortune', 'gros_michel', 'cavendish',
 -- 'halu<ante>' (Hallucination), etc.
@@ -477,34 +480,50 @@ function RS.prob_seed_name(seed)
     return seed
 end
 
-safe_wrap(SMODS, 'pseudorandom_probability', function(ref)
-    return function(card, seed, base_num, base_den, ...)
-        local ret = ref(card, seed, base_num, base_den, ...)
-        local s = RS.stats()
-        if s and type(seed) == 'string' then
-            local e = s.probs[seed]
-            if not e then
-                e = { rolls = 0, hits = 0, num = base_num or 1, den = base_den or 2 }
-                s.probs[seed] = e
-            end
-            e.rolls = e.rolls + 1
-            e.num, e.den = base_num or 1, base_den or 2
-            local identifier, no_mod = ...
-            e.identifier, e.no_mod = identifier or seed, no_mod or false
-            e.card_key = card and card.config and (card.config.center_key or (card.config.center or {}).key)
-            if ret then e.hits = e.hits + 1 end
-            local pa = RS.pa()
-            if pa then
-                local pe = pa.probs[seed]
-                if not pe then
-                    pe = { rolls = 0, hits = 0 }
-                    pa.probs[seed] = pe
-                end
-                pe.rolls = pe.rolls + 1
-                if ret then pe.hits = pe.hits + 1 end
-            end
+function RS.record_probability(card, seed, base_num, base_den, result, identifier, no_mod)
+    local s = RS.stats()
+    if s and type(seed) == 'string' then
+        local e = s.probs[seed]
+        if not e then
+            e = { rolls = 0, hits = 0, num = base_num or 1, den = base_den or 2 }
+            s.probs[seed] = e
         end
+        e.rolls = e.rolls + 1
+        e.num, e.den = base_num or 1, base_den or 2
+        e.identifier, e.no_mod = identifier or seed, no_mod or false
+        e.card_key = card and card.config and (card.config.center_key or (card.config.center or {}).key)
+        if result then e.hits = e.hits + 1 end
+        local pa = RS.pa()
+        if pa then
+            local pe = pa.probs[seed]
+            if not pe then
+                pe = { rolls = 0, hits = 0 }
+                pa.probs[seed] = pe
+            end
+            pe.rolls = pe.rolls + 1
+            if result then pe.hits = pe.hits + 1 end
+        end
+    end
+end
+
+safe_wrap(SMODS, 'pseudorandom_probability', function(ref)
+    return function(card, seed, base_num, base_den, identifier, no_mod, ...)
+        local ret = ref(card, seed, base_num, base_den, identifier, no_mod, ...)
+        RS.record_probability(card, seed, base_num, base_den, ret, identifier, no_mod)
         return ret
+    end
+end)
+
+-- Vanilla performs its comparisons directly against pseudorandom(). Observe the
+-- existing sample without drawing another one or changing the value returned.
+safe_wrap(_G, 'pseudorandom', function(ref)
+    return function(seed, min, max, ...)
+        local sample = ref(seed, min, max, ...)
+        if not (SMODS and SMODS.pseudorandom_probability) and min == nil and max == nil
+            and RS.record_vanilla_roll then
+            RS.record_vanilla_roll(seed, sample)
+        end
+        return sample
     end
 end)
 
@@ -1587,6 +1606,38 @@ local PROB_CENTERS = {
     cavendish = 'j_cavendish', parking = 'j_reserved_parking', halu = 'j_hallucination',
 }
 
+local function probability_card(center_key)
+    if not center_key then return nil end
+    for _, cards in ipairs({ (G.jokers or {}).cards or {}, G.playing_cards or {}, (G.consumeables or {}).cards or {} }) do
+        for _, card in ipairs(cards) do
+            local config = card.config or {}
+            if (config.center_key or (config.center or {}).key) == center_key then return card end
+        end
+    end
+end
+
+local function vanilla_probability(seed)
+    local canonical = type(seed) == 'string' and seed:sub(1, 4) == 'halu' and 'halu' or seed
+    local meta = PROB_META[canonical]
+    if not meta then return nil end
+    local card = probability_card(PROB_CENTERS[canonical])
+    local denominator = meta.den
+    if card and canonical ~= 'lucky_mult' and canonical ~= 'lucky_money' then
+        local extra = card.ability and card.ability.extra
+        if type(extra) == 'number' then denominator = extra
+        elseif type(extra) == 'table' and type(extra.odds) == 'number' then denominator = extra.odds end
+    end
+    return card, denominator
+end
+
+function RS.record_vanilla_roll(seed, sample)
+    if not RS.stats() or type(seed) ~= 'string' or type(sample) ~= 'number' then return end
+    local card, denominator = vanilla_probability(seed)
+    if not denominator then return end
+    local numerator = (G.GAME.probabilities or {}).normal or 1
+    RS.record_probability(card, seed, 1, denominator, sample < numerator / denominator)
+end
+
 -- Use the same live probability calculation as card tooltips. Recorded num/den
 -- are base inputs, so applying modifiers here does not double-count Oops.
 function RS.current_probability(seed)
@@ -1602,19 +1653,14 @@ function RS.current_probability(seed)
     local denominator = (entry and entry.den) or (meta and meta.den)
     if not denominator then return nil, nil end
     local center_key = (entry and entry.card_key) or PROB_CENTERS[seed]
-    local trigger
-    if center_key then
-        for _, cards in ipairs({ (G.jokers or {}).cards or {}, G.playing_cards or {}, (G.consumeables or {}).cards or {} }) do
-            for _, card in ipairs(cards) do
-                local config = card.config or {}
-                if (config.center_key or (config.center or {}).key) == center_key then trigger = card; break end
-            end
-            if trigger then break end
-        end
-    end
+    local trigger = probability_card(center_key)
     local no_mod = entry and entry.no_mod or false
-    if SMODS.get_probability_vars then
+    if SMODS and SMODS.get_probability_vars then
         return SMODS.get_probability_vars(trigger, numerator, denominator, (entry and entry.identifier) or seed, nil, no_mod)
+    end
+    if meta then
+        local _, live_denominator = vanilla_probability(seed)
+        denominator = live_denominator or denominator
     end
     return numerator * (no_mod and 1 or ((G.GAME.probabilities or {}).normal or 1)), denominator
 end
@@ -2006,3 +2052,5 @@ G.FUNCS.runstats_tab_cards = function(e)
     RS._tab = 'cards'
     RS.show_menu()
 end
+
+return RS
