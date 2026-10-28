@@ -6,7 +6,7 @@ A Balatro mod by **andrewleeog** for tracking the current run, with summaries, c
 
 Requires [Lovely](https://github.com/ethangreen-dev/lovely-injector) and [Steamodded](https://github.com/Steamodded/smods).
 
-1. Download or clone this repository.
+1. Download `BalatroRunStats.zip` from the [latest release](https://github.com/andrewleeog/BalatroRunStats/releases/latest), or clone this repository.
 2. Place the repository's contents in a `BalatroRunStats` folder inside your Balatro `Mods` directory. `manifest.json`, `BalatroRunStats.lua`, and `lovely/` should be directly inside that folder.
 3. Restart Balatro.
 
@@ -46,3 +46,7 @@ The patch checks also validate and compile game sources when available:
 - `BALATRO_MODS_DIR`: your Balatro Mods directory, used to find `lovely/dump`. Defaults to the standard Linux Steam/Proton location.
 
 Game sources and loader dependencies are not included in this repository.
+
+## License
+
+[MIT](LICENSE). Redistribution and mod-manager distribution are permitted under this license.
