@@ -11,6 +11,41 @@ source = "BalatroRunStats.lua"
 before = "main.lua"
 name = "runstats.runtime"
 
+# Begin before stock is generated/restored; capture again after tags modify it.
+[[patches]]
+[patches.pattern]
+target = "game.lua"
+pattern = "if G.load_shop_jokers then"
+position = "before"
+match_indent = true
+payload = "if RunStats then RunStats.begin_shop_stock(false) end"
+
+[[patches]]
+[patches.pattern]
+target = "game.lua"
+pattern = "if not nosave_shop then G.E_MANAGER:add_event(Event({ func = function() save_run(); return true end})) end"
+position = "before"
+match_indent = true
+payload = "if RunStats then RunStats.capture_shop_stock() end"
+
+# This runs for paid and free rerolls, before old stock is removed.
+[[patches]]
+[patches.pattern]
+target = "functions/button_callbacks.lua"
+pattern = "calculate_reroll_cost(final_free)"
+position = "before"
+match_indent = true
+payload = "if RunStats then RunStats.capture_shop_stock(); RunStats.begin_shop_stock(true) end"
+
+# Successful voucher redemption, after the charge (also handles free vouchers).
+[[patches]]
+[patches.pattern]
+target = "card.lua"
+pattern = "set_voucher_usage(self)"
+position = "after"
+match_indent = true
+payload = "if RunStats then RunStats.record_shop_voucher(self, true) end"
+
 [[patches]]
 [patches.pattern]
 target = "game.lua"
@@ -100,3 +135,28 @@ pattern = '(?m)^(?<indent>[\t ]*)ease_dollars\((?<args>effects\[ii\]\.[a-z_]+)\)
 position = "at"
 line_prepend = '$indent'
 payload = "if RunStats then RunStats.with_effect_income(effects[ii], function() ease_dollars($args) end) else ease_dollars($args) end"
+
+# Vanilla: one applied scoring pass, after individual Joker effects are gathered.
+# Steamodded replaces these loops and uses the scoped trigger_effects hook.
+[[patches]]
+[patches.regex]
+target = "functions/state_events.lua"
+pattern = '(?m)^(?<indent>[\t ]*)scoring_hand\[i\]\.lucky_trigger = nil[\t ]*$'
+position = "at"
+line_prepend = '$indent'
+payload = """
+if RunStats then RunStats.record_vanilla_trigger(scoring_hand[i], 'scoring', effects) end
+scoring_hand[i].lucky_trigger = nil
+"""
+
+# Both held-card loops: during scoring and at end of round, including repetitions.
+[[patches]]
+[patches.regex]
+target = "functions/state_events.lua"
+pattern = '(?m)^(?<indent>[\t ]*)if reps\[j\] == 1 then[\t ]*$'
+position = "at"
+line_prepend = '$indent'
+payload = """
+if RunStats then RunStats.record_vanilla_trigger(G.hand.cards[i], 'held', effects) end
+if reps[j] == 1 then
+"""

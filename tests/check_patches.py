@@ -118,6 +118,31 @@ assert(total == 22 and income.jokers == 15 and income.cards == 7 and income.othe
 print('Income source patches passed: direct/deferred card payments and returned vanilla effects')
 """
 bootstrap = next(p['payload'] for p in patches if 'runstats.runtime' in p['payload'])
+script += """
+G.GAME.run_stats = RS.fresh_stats()
+G.GAME.round_resets.ante = 1
+"""
+for patch in regex_patches:
+    if 'record_vanilla_trigger' not in patch['payload']:
+        continue
+    script += """
+do
+local card = {base = {suit = 'Hearts', id = 14}}
+local scoring_hand, effects, i, j, reps = {card}, {{chips = 10}}, 1, 1, {1}
+G.hand.cards = {card}
+""" + patch['payload'] + '\n'
+    if "'held'" in patch['payload']:
+        script += 'end\n'  # payload opens the original repetition check
+    script += 'end\n'
+script += """
+local bucket = RS.pa()
+if SMODS then
+    assert(not next(bucket.scoring_triggers) and not next(bucket.held_triggers), 'vanilla patches defer to Steamodded')
+else
+    assert(bucket.scoring_triggers['Hearts:14'] == 1 and bucket.held_triggers['Hearts:14'] == 1)
+end
+print('Trigger patch checks passed: exact scoring/held payloads and no double counting with Steamodded')
+"""
 script += f"local boot = assert(loadstring({json.dumps(bootstrap)}))\n"
 script += """
 local calls = 0

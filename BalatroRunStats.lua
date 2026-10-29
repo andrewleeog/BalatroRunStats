@@ -36,6 +36,8 @@ local PA_DEFAULTS = {
     cards_played = {},     -- ['Hearts:14'] = count (per-ante, per base card)
     cards_discarded = {},  -- same key space; deck additions merge into the base entry
     cards_drawn = {},      -- completed draws from the deck into the hand
+    scoring_triggers = {},
+    held_triggers = {},
     hand_types = {},
     hand_scores = {},
     spending = {},
@@ -58,6 +60,8 @@ function RS.fresh_stats()
         per_ante = {},     -- [ante] = per-ante bucket
         blinds = {},      -- chronological blind history, saved with the run
         shops = {},       -- cash on first entry to each shop
+        shop_stock = {},  -- offers grouped by visit and reroll; plain save data
+        shop_vouchers = {}, -- voucher offers by the ante in which they appeared
         draw_tokens = {}, -- latest draw per playing-card ID; survives save/load
         probs = {},        -- [seed] = {rolls, hits, num, den} — every chance roll
         skips = 0,
@@ -178,6 +182,9 @@ function RS.played_antes()
         if furthest <= 0 or ante <= furthest then add(ante) end
     end
     for _, blind in ipairs((s or {}).blinds or {}) do add(blind.ante) end
+    for _, group in ipairs((s or {}).shop_stock or {}) do
+        if furthest <= 0 or group.ante <= furthest then add(group.ante) end
+    end
     add(furthest)
     table.sort(antes)
     return antes
@@ -540,6 +547,7 @@ safe_wrap(_G, 'end_round', function(ref)
         if record then
             local round = G.GAME.current_round
             record.target = G.GAME.blind.chips
+            record.total_score = G.GAME.chips
             record.hands_used = round.hands_played or 0
             record.unused = math.max(0, round.hands_left or 0)
             record.won = G.GAME.chips >= record.target
@@ -809,6 +817,112 @@ function RS.card_rank_label(id)
     return CARD_RANK_LABEL[id] or tostring(id)
 end
 
+local shop_tokens = setmetatable({}, {__mode = 'k'})
+local function shop_visit()
+    local stats = RS.stats()
+    local blind = stats and (stats.blinds or {})[stats.current_blind or 0]
+    local ante = blind and blind.ante or snapshot_ante() or current_ante()
+    return tostring(ante) .. ':' .. tostring(G.GAME.round or 0), ante, blind and blind.label or tostring(ante)
+end
+
+function RS.begin_shop_stock(reroll)
+    local stats = RS.stats()
+    if not stats then return end
+    stats.shop_stock = stats.shop_stock or {}
+    local key, ante, label = shop_visit()
+    local last = stats.shop_stock[#stats.shop_stock]
+    if not reroll and last and last.visit == key then return last end
+    local group = {visit = key, ante = ante, label = label,
+        reroll = reroll and last and last.visit == key and last.reroll + 1 or (reroll and 1 or 0),
+        capacity = (G.GAME.shop or {}).joker_max or 2, cards = {}}
+    stats.shop_stock[#stats.shop_stock + 1] = group
+    return group
+end
+
+local function shop_offer(card)
+    local center = card.config and card.config.center or {}
+    local set = center.set or (card.ability or {}).set
+    local playing = set == 'Default' or set == 'Enhanced' or card.playing_card
+    local category = playing and 'Playing' or set
+    if category ~= 'Joker' and category ~= 'Tarot' and category ~= 'Planet'
+        and category ~= 'Spectral' and category ~= 'Playing' and category ~= 'Voucher' then return end
+    local key = playing and RS.card_key(card) or (center.key or (card.config or {}).center_key)
+    if not key then return end
+    local name
+    if playing then
+        name = RS.card_rank_label(card.base.id) .. ' ' .. localize(card.base.suit, 'suits_plural')
+    elseif G.localization and G.localization.descriptions and G.localization.descriptions[set]
+        and G.localization.descriptions[set][key] then
+        name = localize{type = 'name_text', set = set, key = key}
+    end
+    name = type(name) == 'string' and name or (card.ability or {}).name or key
+    local edition = 'base'
+    if card.edition then
+        if type(card.edition.type) == 'string' then edition = card.edition.type
+        else
+            local keys = {}
+            for k, value in pairs(card.edition) do if value == true then keys[#keys + 1] = k end end
+            table.sort(keys)
+            edition = keys[1] or 'base'
+        end
+    end
+    return {key = key, category = category, name = name, cost = card.cost or 0,
+        edition = edition,
+        enhancement = playing and set == 'Enhanced' and (card.ability or {}).name or nil,
+        seal = card.seal}
+end
+
+function RS.record_shop_voucher(card, bought)
+    local stats = RS.stats()
+    if not stats then return end
+    local offer = shop_offer(card)
+    if not offer or offer.category ~= 'Voucher' then return end
+    if bought and not (card.shop_voucher or (G.shop_vouchers and card.area == G.shop_vouchers)) then return end
+    stats.shop_vouchers = stats.shop_vouchers or {}
+    -- Vouchers refresh when the ante advances, including the post-Boss shop.
+    local ante = current_ante()
+    local rows = stats.shop_vouchers[ante] or {}
+    stats.shop_vouchers[ante] = rows
+    for _, row in ipairs(rows) do
+        if row.key == offer.key then
+            if bought then row.bought, row.paid = true, offer.cost end
+            return row
+        end
+    end
+    offer.bought, offer.paid = bought == true, bought and offer.cost or nil
+    rows[#rows + 1] = offer
+    return offer
+end
+
+function RS.capture_shop_vouchers()
+    if not RS.stats() then return end
+    for _, card in ipairs((G.shop_vouchers or {}).cards or {}) do RS.record_shop_voucher(card, false) end
+end
+
+function RS.capture_shop_stock()
+    RS.capture_shop_vouchers()
+    local stats = RS.stats()
+    if not stats or not G.shop_jokers or not G.shop_jokers.cards then return end
+    local group = RS.begin_shop_stock(false)
+    group.capacity = math.max(group.capacity, (G.GAME.shop or {}).joker_max or 2)
+    local seen = {}
+    for index, offer in ipairs(group.cards) do seen[offer.token] = index end
+    for _, card in ipairs(G.shop_jokers.cards) do
+        local offer = shop_offer(card)
+        if offer then
+            local token = card.sort_id and ('card:' .. tostring(card.sort_id)) or shop_tokens[card]
+            if not token then
+                stats.shop_token_id = (stats.shop_token_id or 0) + 1
+                token = 'fallback:' .. stats.shop_token_id
+                shop_tokens[card] = token
+            end
+            offer.token = token
+            local index = seen[token] or (#group.cards + 1)
+            group.cards[index], seen[token] = offer, index
+        end
+    end
+end
+
 local function record_card_keys(bucket, field, cards)
     if not bucket then return end
     local t = bucket[field]
@@ -818,6 +932,55 @@ local function record_card_keys(bucket, field, cards)
         if k then t[k] = (t[k] or 0) + 1 end
     end
 end
+
+function RS.record_card_trigger(card, kind)
+    if not card or card.debuff or not RS.card_key(card) then return end
+    if kind ~= 'scoring' and kind ~= 'held' then return end
+    record_card_keys(RS.pa(), kind .. '_triggers', {card})
+end
+
+function RS.record_vanilla_trigger(card, kind, effects)
+    if SMODS then return end -- Steamodded uses its effect application hook.
+    for _, effect in ipairs(effects or {}) do
+        if type(effect) == 'table' and next(effect) then
+            RS.record_card_trigger(card, kind)
+            return
+        end
+    end
+end
+
+-- Count applied passes, after Joker effects have joined the card's own effects.
+-- Scoping avoids counting unrelated calculate_effect/preview calls. Quantum
+-- enhancements share one pass, while Red Seal/Joker repetitions get new passes.
+local trigger_scopes = setmetatable({}, {__mode = 'k'})
+local trigger_main = {}
+local function trigger_thread() return coroutine.running() or trigger_main end
+for _, method in ipairs({'score_card', 'calculate_end_of_round_effects'}) do
+    safe_wrap(SMODS, method, function(ref)
+        return function(first, second, ...)
+            local context = method == 'score_card' and second or first
+            local thread = trigger_thread()
+            local previous = trigger_scopes[thread]
+            local area = context and context.cardarea
+            trigger_scopes[thread] = {card = method == 'score_card' and first or nil,
+                area = area, kind = area == G.play and 'scoring' or (area == G.hand and 'held' or nil)}
+            local result = pack_results(ref(first, second, ...))
+            trigger_scopes[thread] = previous
+            return unpack(result, 1, result.n)
+        end
+    end)
+end
+safe_wrap(SMODS, 'trigger_effects', function(ref)
+    return function(effects, card, ...)
+        local scope = trigger_scopes[trigger_thread()]
+        local result = pack_results(ref(effects, card, ...))
+        if scope and scope.kind and card and (scope.card == card or (not scope.card and card.area == scope.area))
+            and result[1] and result[1].calculated then
+            RS.record_card_trigger(card, scope.kind)
+        end
+        return unpack(result, 1, result.n)
+    end
+end)
 
 local function draw_token_key(card)
     if card.playing_card then return 'card:' .. tostring(card.playing_card) end
@@ -902,6 +1065,8 @@ safe_wrap(CardArea, 'emplace', function(ref)
         local source = card and draw_sources[card]
         if card then draw_sources[card] = nil end
         local result = ref(self, card, ...)
+        if self == G.shop_jokers then RS.capture_shop_stock() end
+        if self == G.shop_vouchers then RS.capture_shop_vouchers() end
         if source and self == G.hand and card.area == self and source.stats == RS.stats() then
             local stats, bucket = source.stats, source.bucket
             stats.cards_drawn = (stats.cards_drawn or 0) + 1
@@ -1192,7 +1357,8 @@ end
 
 RS._card_suit = 1 -- 1 = All suits
 RS._card_rank = 1 -- 1 = All ranks
-RS._card_mode = 1 -- 1 = Played, 2 = Discarded, 3 = Drawn, 4 = Use rate
+RS._card_mode = 1 -- Played, Discarded, Drawn, Use rate, Triggers
+RS._show_scoring_triggers, RS._show_held_triggers = true, true
 
 local CARD_SUITS = { 'Spades', 'Hearts', 'Diamonds', 'Clubs' }
 local CARD_SUIT_COLOURS = {
@@ -1204,9 +1370,15 @@ local CARD_SUIT_COLOURS = {
 local CARD_RANKS = { 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14 }
 local CARD_SUIT_OPTS = { 'All suits', 'Spades', 'Hearts', 'Diamonds', 'Clubs' }
 local CARD_RANK_OPTS = { 'All ranks', '2', '3', '4', '5', '6', '7', '8', '9', '10', 'J', 'Q', 'K', 'A' }
-local CARD_MODE_OPTS = { 'Played', 'Discarded', 'Drawn', 'Use rate' }
+local CARD_MODE_OPTS = { 'Played', 'Discarded', 'Drawn', 'Use rate', 'Triggers' }
 local CARD_MODE_FIELDS = { Played = 'cards_played', Discarded = 'cards_discarded', Drawn = 'cards_drawn' }
 local CARD_RANK_ID = { J = 11, Q = 12, K = 13, A = 14 }
+
+function RS.trigger_colour(colour, held)
+    if not held then return colour end
+    return {colour[1] + (1 - colour[1]) * 0.45, colour[2] + (1 - colour[2]) * 0.45,
+        colour[3] + (1 - colour[3]) * 0.45, colour[4] or 1}
+end
 
 -- Chart data: one x bucket per RANK; within a bucket, one bar per suit
 -- (colour-coded) holding that suit's count for the active mode.
@@ -1225,7 +1397,7 @@ function RS.card_chart_data()
     local field = CARD_MODE_FIELDS[mode]
 
     -- aggregate the selected field per (suit, rank id) over the ante slice
-    local agg, usage_drawn, usage_played = {}, {}, {}
+    local agg, usage_drawn, usage_played, scoring, held = {}, {}, {}, {}, {}
     local s = RS.stats()
     if s then
         for a, bucket in pairs(s.per_ante or {}) do
@@ -1240,6 +1412,10 @@ function RS.card_chart_data()
                 end
                 for key, count in pairs(bucket.usage_drawn or {}) do bump(usage_drawn, key, count) end
                 for key, count in pairs(bucket.usage_played or {}) do bump(usage_played, key, count) end
+                if mode == 'Triggers' then
+                    for key, count in pairs(bucket.scoring_triggers or {}) do bump(scoring, key, count) end
+                    for key, count in pairs(bucket.held_triggers or {}) do bump(held, key, count) end
+                end
             end
         end
     end
@@ -1249,13 +1425,18 @@ function RS.card_chart_data()
         suits_shown[#suits_shown + 1] = su
         cols[#cols + 1] = CARD_SUIT_COLOURS[su]
     end
-    local values, drawn_total, played_total = {}, 0, 0
+    local values, segments, drawn_total, played_total = {}, {}, 0, 0
     for ri, id in ipairs(ranks) do
         labels[ri] = RS.card_rank_label(id)
         values[ri] = {}
+        segments[ri] = {}
         for si, su in ipairs(suits_shown) do
             local key = su .. ':' .. id
-            if mode == 'Use rate' then
+            if mode == 'Triggers' then
+                local sc = RS._show_scoring_triggers and (scoring[key] or 0) or 0
+                local he = RS._show_held_triggers and (held[key] or 0) or 0
+                values[ri][si], segments[ri][si] = sc + he, {sc, he}
+            elseif mode == 'Use rate' then
                 local drawn, played = usage_drawn[key] or 0, usage_played[key] or 0
                 values[ri][si] = drawn > 0 and (100 * played / drawn) or false
                 drawn_total, played_total = drawn_total + drawn, played_total + played
@@ -1265,7 +1446,8 @@ function RS.card_chart_data()
         end
     end
     return { ranks = ranks, labels = labels, suits = suits_shown, cols = cols,
-        values = values, mode = mode, rate = mode == 'Use rate', drawn_total = drawn_total, played_total = played_total }
+        values = values, segments = mode == 'Triggers' and segments or nil,
+        mode = mode, rate = mode == 'Use rate', drawn_total = drawn_total, played_total = played_total }
 end
 
 RSCardChart = Moveable:extend()
@@ -1325,10 +1507,21 @@ function RSCardChart:draw()
             local row = data.values[ri]
             for si = 1, m do
                 local v = row[si]
-                if type(v) == 'number' then
+                local x = pad_l + (ri - 1) * slot + slot / 2 - (bw * m) / 2 + (si - 1) * bw
+                if data.segments then
+                    local bottom = pad_t + ph
+                    for index, count in ipairs(data.segments[ri][si]) do
+                        if count > 0 then
+                            local bh = count / maxv * ph
+                            love.graphics.setColor(RS.trigger_colour(data.cols[si], index == 2))
+                            love.graphics.rectangle('fill', x, bottom - bh, bw - 0.015, bh)
+                            bottom = bottom - bh
+                        end
+                    end
+                elseif type(v) == 'number' then
                     local bh = math.max(v / maxv * ph, v > 0 and 0.02 or 0.004)
                     love.graphics.setColor(data.cols[si])
-                    love.graphics.rectangle('fill', pad_l + (ri - 1) * slot + slot / 2 - (bw * m) / 2 + (si - 1) * bw,
+                    love.graphics.rectangle('fill', x,
                         pad_t + ph - bh, bw - 0.015, bh)
                 end
             end
@@ -1343,6 +1536,9 @@ function RSCardChart:draw()
             love.graphics.rectangle('fill', lx, 0.05, 0.13, 0.13)
             self:_text(su:sub(1, 1), lx + 0.17, 0.02, 0.22, {1, 1, 1, 0.85})
             lx = lx + 0.17 + self.font.FONT:getWidth(su:sub(1, 1)) * (0.22 * self.font.FONTSCALE / G.TILESIZE) + 0.12
+        end
+        if data.segments then
+            self:_text('Base: Scoring   Light: Held In Hand', pad_l + 3.2, 0.02, 0.20, {1, 1, 1, 0.85})
         end
         -- mode indicator, right-aligned
         local mode_txt = 'showing: ' .. (data.mode or 'Played')
@@ -1476,6 +1672,75 @@ local function section_title(text)
     return { n = G.UIT.R, config = { align = 'cl', padding = 0.04 }, nodes = {
         { n = G.UIT.T, config = { text = text, scale = 0.3, colour = G.C.WHITE, shadow = true } },
     } }
+end
+
+-- Match the pools used by reset_idol_card/reset_castle_card. Count base
+-- identities: Wild cards are not extra copies of every suit in these rolls.
+function RS.joker_target_summary()
+    local result = {total = #(G.playing_cards or {}), idol = {}, castle = {}, idol_total = 0, castle_total = 0}
+    local idols, suits = {}, {}
+    for _, card in ipairs(G.playing_cards or {}) do
+        local base = card.base or {}
+        local stone = card.ability and card.ability.effect == 'Stone Card'
+        local no_suit = SMODS and SMODS.has_no_suit and SMODS.has_no_suit(card)
+        local no_rank = SMODS and SMODS.has_no_rank and SMODS.has_no_rank(card)
+        if not stone and not no_suit and base.suit then
+            result.castle_total = result.castle_total + 1
+            suits[base.suit] = (suits[base.suit] or 0) + 1
+            if not no_rank and base.id then
+                result.idol_total = result.idol_total + 1
+                local key = RS.card_key(card)
+                idols[key] = idols[key] or {suit = base.suit, rank = base.id, count = 0}
+                idols[key].count = idols[key].count + 1
+            end
+        end
+    end
+    for _, entry in pairs(idols) do result.idol[#result.idol + 1] = entry end
+    -- Keep the four standard suits visible even when a suit has no copies.
+    for _, suit in ipairs(CARD_SUITS) do suits[suit] = suits[suit] or 0 end
+    for suit, count in pairs(suits) do result.castle[#result.castle + 1] = {suit = suit, count = count} end
+    local function order(a, b)
+        if a.count ~= b.count then return a.count > b.count end
+        if a.suit ~= b.suit then return a.suit < b.suit end
+        return (a.rank or 0) > (b.rank or 0)
+    end
+    for _, kind in ipairs({'idol', 'castle'}) do
+        table.sort(result[kind], order)
+        local total = result[kind .. '_total']
+        for _, entry in ipairs(result[kind]) do
+            entry.total = total
+            entry.percentage = total > 0 and entry.count / total * 100 or 0
+        end
+    end
+    return result
+end
+
+local function joker_target_columns()
+    local data = RS.joker_target_summary()
+    local columns = {}
+    for _, kind in ipairs({'idol', 'castle'}) do
+        local nodes = {section_title(kind == 'idol' and 'The Idol — Top Targets' or 'Castle — Suits')}
+        for i = 1, math.min(4, #data[kind]) do
+            local entry = data[kind][i]
+            local suit = localize(entry.suit, 'suits_plural')
+            local label = kind == 'idol' and (RS.card_rank_label(entry.rank) .. ' ' .. suit) or suit
+            nodes[#nodes + 1] = {n = G.UIT.R, config = {align = 'cm', padding = 0.025}, nodes = {
+                {n = G.UIT.C, config = {align = 'cl', minw = 2.6}, nodes = {
+                    {n = G.UIT.T, config = {text = label, scale = 0.26,
+                        colour = CARD_SUIT_COLOURS[entry.suit] or G.C.UI.TEXT_LIGHT, shadow = true}},
+                }},
+                {n = G.UIT.C, config = {align = 'cr', minw = 2.6}, nodes = {
+                    {n = G.UIT.T, config = {text = string.format('%d / %d  (%0.1f%%)', entry.count, entry.total, entry.percentage),
+                        scale = 0.26, colour = G.C.UI.TEXT_LIGHT, shadow = true}},
+                }},
+            }}
+        end
+        if data[kind .. '_total'] == 0 then nodes[#nodes + 1] = section_title('No eligible cards') end
+        columns[#columns + 1] = {n = G.UIT.C, config = {align = 'tm', padding = 0.08, minw = 6.2}, nodes = nodes}
+    end
+    return {
+        {n = G.UIT.R, config = {align = 'cm'}, nodes = columns},
+    }
 end
 
 local function stats_tab_columns()
@@ -1628,14 +1893,21 @@ local function blind_history(wins_only)
 end
 
 function RS.score_chart_data()
-    local labels, best, targets = {}, {}, {}
+    local labels, best, targets, totals = {}, {}, {}, {}
+    local stats = RS.stats() or {}
+    local current = (stats.blinds or {})[stats.current_blind or 0]
     for _, r in ipairs(blind_history()) do
         labels[#labels + 1] = r.label .. (r.partial and '*' or '')
         best[#best + 1] = r.best or 0
         targets[#targets + 1] = r.target or 0
+        -- Read the actual accumulated score, including boss adjustments. Older
+        -- completed rounds without a saved total remain gaps in this series.
+        local total = r == current and not r.completed and G.GAME.chips or r.total_score
+        totals[#totals + 1] = total or false
     end
     return { antes = labels, series = {
         series_of('Best hand', G.C.RED, best), series_of('Blind target', G.C.BLUE, targets),
+        series_of('Total round score', G.C.GREEN, totals),
     }, empty = 'Play a blind to start score history' }
 end
 
@@ -2300,6 +2572,7 @@ end
 
 function RS.show_menu()
     RS.capture_snapshot()
+    if G.STATE == G.STATES.SHOP and G.shop then RS.capture_shop_stock() end
     G.FUNCS.overlay_menu{
         definition = create_UIBox_runstats(), config = { no_esc = RS._return_screen ~= nil },
     }
@@ -2344,6 +2617,16 @@ G.FUNCS.runstats_cards_reset = function(e)
     RS._card_suit = 1
     RS._card_rank = 1
     RS._card_mode = 1
+    RS._show_scoring_triggers, RS._show_held_triggers = true, true
+    RS.show_menu()
+end
+
+G.FUNCS.runstats_cards_scoring_triggers = function()
+    RS._show_scoring_triggers = not RS._show_scoring_triggers
+    RS.show_menu()
+end
+G.FUNCS.runstats_cards_held_triggers = function()
+    RS._show_held_triggers = not RS._show_held_triggers
     RS.show_menu()
 end
 
@@ -2363,15 +2646,23 @@ local function cards_slicer_row()
 end
 
 local function cards_tab()
-    local contents = {
-        cards_slicer_row(),
-        { n = G.UIT.R, config = { align = 'cm', padding = 0.05 }, nodes = {
+    local contents = {cards_slicer_row()}
+    if CARD_MODE_OPTS[RS._card_mode or 1] == 'Triggers' then
+        contents[#contents + 1] = {n = G.UIT.R, config = {align = 'cm', padding = 0.04}, nodes = {
+            UIBox_button{label = {'Scoring Triggers: ' .. (RS._show_scoring_triggers and 'On' or 'Off')},
+                button = 'runstats_cards_scoring_triggers', col = true, minw = 3.7, minh = 0.4, scale = 0.28,
+                colour = RS._show_scoring_triggers and G.C.BLUE or G.C.UI.BACKGROUND_INACTIVE},
+            UIBox_button{label = {'Held In Hand: ' .. (RS._show_held_triggers and 'On' or 'Off')},
+                button = 'runstats_cards_held_triggers', col = true, minw = 3.7, minh = 0.4, scale = 0.28,
+                colour = RS._show_held_triggers and G.C.BLUE or G.C.UI.BACKGROUND_INACTIVE},
+        }}
+    end
+    contents[#contents + 1] = { n = G.UIT.R, config = { align = 'cm', padding = 0.05 }, nodes = {
             { n = G.UIT.O, config = { w = 13.4, h = 4.6, object = RSCardChart({
                 w = 13.4, h = 4.6,
                 data = RS.card_chart_data,
             }) } },
-        } },
-    }
+        } }
     local data = RS.card_chart_data()
     if data.rate then
         contents[#contents + 1] = { n = G.UIT.R, config = { align = 'cm', padding = 0.04 }, nodes = {
@@ -2380,6 +2671,198 @@ local function cards_tab()
                 .. '). Each draw counts once; blank bars have no tracked draws.',
                 scale = 0.23, colour = G.C.UI.TEXT_LIGHT, shadow = true } },
         } }
+    end
+    return contents
+end
+
+RS._shop_view, RS._shop_page, RS._shop_category = 'history', 1, 'Joker'
+local SHOP_CATEGORIES = {Joker = 'Jokers', Planet = 'Planets', Tarot = 'Tarots', Playing = 'Playing Cards', Spectral = 'Spectral Cards'}
+
+function RS.shop_categories()
+    local categories = {'Joker', 'Planet', 'Tarot'}
+    local game = G.GAME or {}
+    local vouchers = game.used_vouchers or {}
+    local playing = vouchers.v_magic_trick or vouchers.v_illusion
+    local back = game.selected_back or {}
+    local spectral = game.selected_back_key == 'b_ghost' or back.name == 'Ghost Deck'
+        or (((back.effect or {}).center or {}).key == 'b_ghost')
+    -- Preserve access to offers seen through modded shop rules, too.
+    for _, group in ipairs((RS.stats() or {}).shop_stock or {}) do
+        for _, offer in ipairs(group.cards) do
+            if offer.category == 'Playing' then playing = true end
+            if offer.category == 'Spectral' then spectral = true end
+        end
+    end
+    if playing then categories[#categories + 1] = 'Playing' end
+    if spectral then categories[#categories + 1] = 'Spectral' end
+    return categories
+end
+
+function RS.shop_history_pages()
+    local stock = (RS.stats() or {}).shop_stock or {}
+    local pages, page, count = {}, {}, 0
+    local function flush()
+        if #page > 0 then pages[#pages + 1] = page; page, count = {}, 0 end
+    end
+    for index = #stock, 1, -1 do
+        local group = stock[index]
+        if RS.in_slice(group.ante) then
+            local size = #group.cards
+            for first = 1, size, 12 do
+                local last = math.min(size, first + 11)
+                local n = last - first + 1
+                if count + n > 12 then flush() end
+                page[#page + 1] = {group = group, first = first, last = last}
+                count = count + n
+            end
+        end
+    end
+    flush()
+    return pages
+end
+
+function RS.shop_frequency(category)
+    local counts, rows = {}, {}
+    for _, group in ipairs((RS.stats() or {}).shop_stock or {}) do
+        if RS.in_slice(group.ante) then
+            for _, offer in ipairs(group.cards) do
+                if offer.category == category then
+                    local row = counts[offer.key]
+                    if not row then row = {key = offer.key, name = offer.name, count = 0}; counts[offer.key] = row end
+                    row.count = row.count + 1
+                end
+            end
+        end
+    end
+    for _, row in pairs(counts) do rows[#rows + 1] = row end
+    table.sort(rows, function(a, b)
+        if a.count ~= b.count then return a.count > b.count end
+        if a.name ~= b.name then return a.name < b.name end
+        return a.key < b.key
+    end)
+    while #rows > 5 do table.remove(rows) end
+    return rows
+end
+
+function RS.voucher_history_pages()
+    local history, antes, pages, page = (RS.stats() or {}).shop_vouchers or {}, {}, {}, {}
+    for ante in pairs(history) do if RS.in_slice(ante) then antes[#antes + 1] = ante end end
+    table.sort(antes, function(a, b) return a > b end)
+    for _, ante in ipairs(antes) do
+        for _, voucher in ipairs(history[ante]) do
+            if #page == 8 then pages[#pages + 1] = page; page = {} end
+            page[#page + 1] = {ante = ante, voucher = voucher}
+        end
+    end
+    if #page > 0 then pages[#pages + 1] = page end
+    return pages
+end
+
+function RS.shop_edition_label(edition)
+    if edition == nil then return 'Not recorded' end -- older saved offers
+    if edition == 'base' then return 'Base' end
+    local key = 'e_' .. edition
+    if G.localization and ((G.localization.descriptions or {}).Edition or {})[key] then
+        return localize{type = 'name_text', set = 'Edition', key = key}
+    end
+    local labels = {foil = 'Foil', holo = 'Holographic', polychrome = 'Polychrome', negative = 'Negative'}
+    return labels[edition] or (edition:gsub('_', ' '):gsub('^%l', string.upper))
+end
+
+G.FUNCS.runstats_shop_view = function()
+    RS._shop_view = ({history = 'frequency', frequency = 'vouchers', vouchers = 'history'})[RS._shop_view] or 'history'
+    RS.show_menu()
+end
+G.FUNCS.runstats_shop_category = function()
+    local categories, index = RS.shop_categories(), 0
+    for i, category in ipairs(categories) do if category == RS._shop_category then index = i; break end end
+    RS._shop_category = categories[index % #categories + 1]
+    RS.show_menu()
+end
+G.FUNCS.runstats_shop_older = function()
+    if RS._shop_view == 'vouchers' then
+        RS._voucher_page = math.min((RS._voucher_page or 1) + 1, math.max(1, #RS.voucher_history_pages()))
+    else
+        RS._shop_page = math.min((RS._shop_page or 1) + 1, math.max(1, #RS.shop_history_pages()))
+    end
+    RS.show_menu()
+end
+G.FUNCS.runstats_shop_newer = function()
+    if RS._shop_view == 'vouchers' then RS._voucher_page = math.max(1, (RS._voucher_page or 1) - 1)
+    else RS._shop_page = math.max(1, (RS._shop_page or 1) - 1) end
+    RS.show_menu()
+end
+
+local function shop_text(text, colour, scale, padding, align)
+    return {n = G.UIT.R, config = {align = align or 'cl', padding = padding or 0.04}, nodes = {
+        {n = G.UIT.T, config = {text = text, scale = scale or 0.27, colour = colour or G.C.UI.TEXT_LIGHT, shadow = true}},
+    }}
+end
+
+local function shop_tab()
+    local controls = {UIBox_button{label = {'View: ' .. (({history = 'History', frequency = 'Top 5 Seen', vouchers = 'Vouchers'})[RS._shop_view] or 'History')},
+        button = 'runstats_shop_view', col = true, minw = 3, minh = 0.4, scale = 0.3, colour = G.C.BLUE}}
+    local contents = {{n = G.UIT.R, config = {align = 'cm', padding = 0.04}, nodes = controls}}
+    if RS._shop_view == 'frequency' then
+        local categories, valid = RS.shop_categories(), false
+        for _, category in ipairs(categories) do if category == RS._shop_category then valid = true end end
+        if not valid then RS._shop_category = categories[1] end
+        controls[#controls + 1] = UIBox_button{label = {'Type: ' .. SHOP_CATEGORIES[RS._shop_category]},
+            button = 'runstats_shop_category', col = true, minw = 3.5, minh = 0.4, scale = 0.3, colour = G.C.GREEN}
+        local rows = RS.shop_frequency(RS._shop_category)
+        local nodes = {section_title('Most Seen ' .. SHOP_CATEGORIES[RS._shop_category])}
+        for rank, row in ipairs(rows) do
+            nodes[#nodes + 1] = shop_text(rank .. '. ' .. row.name .. '   -   ' .. row.count .. ' seen', G.C.WHITE, 0.31)
+        end
+        if #rows == 0 then nodes[#nodes + 1] = shop_text('No offers recorded for this type yet.') end
+        contents[#contents + 1] = {n = G.UIT.R, config = {align = 'cm', padding = 0.12, minh = 4.4, minw = 12.8,
+            colour = G.C.BLACK, r = 0.1}, nodes = {{n = G.UIT.C, config = {align = 'tm'}, nodes = nodes}}}
+    elseif RS._shop_view == 'vouchers' then
+        local pages = RS.voucher_history_pages()
+        RS._voucher_page = math.max(1, math.min(RS._voucher_page or 1, math.max(1, #pages)))
+        for _, spec in ipairs({{'Newer', 'runstats_shop_newer', RS._voucher_page > 1},
+            {'Older', 'runstats_shop_older', RS._voucher_page < #pages}}) do
+            controls[#controls + 1] = UIBox_button{label = {spec[1]}, button = spec[3] and spec[2] or 'nil', col = true,
+                minw = 1.6, minh = 0.4, scale = 0.3, colour = spec[3] and G.C.GREEN or G.C.UI.BACKGROUND_INACTIVE}
+        end
+        controls[#controls + 1] = {n = G.UIT.T, config = {text = 'Page ' .. RS._voucher_page .. ' / ' .. math.max(1, #pages),
+            scale = 0.26, colour = G.C.UI.TEXT_LIGHT}}
+        local previous, nodes
+        for _, entry in ipairs(pages[RS._voucher_page] or {}) do
+            if previous ~= entry.ante then
+                previous, nodes = entry.ante, {shop_text('Ante ' .. entry.ante, G.C.FILTER, 0.23, 0.01, 'cm')}
+                contents[#contents + 1] = {n = G.UIT.R, config = {align = 'cm', padding = 0.015}, nodes = {
+                    {n = G.UIT.C, config = {align = 'cm', minw = 9, padding = 0.01, colour = G.C.BLACK, r = 0.1}, nodes = nodes},
+                }}
+            end
+            local row = entry.voucher
+            nodes[#nodes + 1] = shop_text(row.name .. '   $' .. number_format(row.paid or row.cost)
+                .. '   |   ' .. (row.bought and 'Bought' or 'Not bought'), row.bought and G.C.GREEN or G.C.WHITE, 0.25, 0.01, 'cm')
+        end
+        if not previous then contents[#contents + 1] = shop_text('Visit a shop to start recording voucher offers.') end
+    else
+        local pages = RS.shop_history_pages()
+        RS._shop_page = math.max(1, math.min(RS._shop_page or 1, math.max(1, #pages)))
+        for _, spec in ipairs({{'Newer', 'runstats_shop_newer', RS._shop_page > 1},
+            {'Older', 'runstats_shop_older', RS._shop_page < #pages}}) do
+            controls[#controls + 1] = UIBox_button{label = {spec[1]}, button = spec[3] and spec[2] or 'nil', col = true,
+                minw = 1.6, minh = 0.4, scale = 0.3, colour = spec[3] and G.C.GREEN or G.C.UI.BACKGROUND_INACTIVE}
+        end
+        controls[#controls + 1] = {n = G.UIT.T, config = {text = 'Page ' .. RS._shop_page .. ' / ' .. math.max(1, #pages),
+            scale = 0.26, colour = G.C.UI.TEXT_LIGHT}}
+        local panes = pages[RS._shop_page] or {}
+        for _, pane in ipairs(panes) do
+            local nodes, group = {}, pane.group
+            for j = pane.first, pane.last do
+                local offer = group.cards[j]
+                local label = offer.name .. '  [' .. RS.shop_edition_label(offer.edition) .. ']   $' .. number_format(offer.cost)
+                nodes[#nodes + 1] = shop_text(label, G.C.WHITE, math.min(0.25, 15 / math.max(1, #label)), 0.01, 'cm')
+            end
+            contents[#contents + 1] = {n = G.UIT.R, config = {align = 'cm', padding = 0.015}, nodes = {
+                {n = G.UIT.C, config = {align = 'cm', padding = 0.01, minw = 9, colour = G.C.BLACK, r = 0.1}, nodes = nodes},
+            }}
+        end
+        if #panes == 0 then contents[#contents + 1] = shop_text('Visit a shop to start recording offers.') end
     end
     return contents
 end
@@ -2404,6 +2887,7 @@ local function tabs_row()
         tab_button('Trends', 'runstats_tab_dash', 'dashboard'),
         tab_button('Prob', 'runstats_tab_prob', 'probabilities'),
         tab_button('Cards', 'runstats_tab_cards', 'cards'),
+        tab_button('Shop', 'runstats_tab_shop', 'shop'),
     } }
 end
 
@@ -2511,9 +2995,12 @@ function create_UIBox_runstats()
         for _, row in ipairs(cards_tab()) do
             contents[#contents + 1] = row
         end
+    elseif RS._tab == 'shop' then
+        for _, row in ipairs(shop_tab()) do contents[#contents + 1] = row end
     else
         local cols = stats_tab_columns()
         contents[#contents + 1] = { n = G.UIT.R, config = { align = 'ct' }, nodes = cols }
+        for _, row in ipairs(joker_target_columns()) do contents[#contents + 1] = row end
     end
 
     return create_UIBox_generic_options({
@@ -2546,6 +3033,13 @@ end
 
 G.FUNCS.runstats_tab_cards = function(e)
     RS._tab = 'cards'
+    RS.show_menu()
+end
+
+G.FUNCS.runstats_tab_shop = function()
+    RS._tab = 'shop'
+    RS._shop_page = 1
+    RS._voucher_page = 1
     RS.show_menu()
 end
 

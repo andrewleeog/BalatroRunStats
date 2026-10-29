@@ -34,6 +34,20 @@ Blind = {
 if vanilla_mode then SMODS = nil
 else SMODS = {pseudorandom_probability = function(_, seed) return pseudorandom(seed) < 1 end} end
 if SMODS then
+    -- Run the real scoring/repetition loops with deterministic effect producers.
+    local source_file = assert(io.open((os.getenv('SMODS_DIR') or '../smods-stable') .. '/src/utils.lua'))
+    local source = source_file:read('*a'); source_file:close()
+    assert(loadstring(assert(source:match('(function SMODS.score_card.-)\nfunction SMODS.calculate_main_scoring'))))()
+    assert(loadstring(assert(source:match('(function SMODS.calculate_end_of_round_effects.-)\nfunction SMODS.calculate_destroying_cards'))))()
+    function eval_card(card) return {active = card.test_active} end
+    SMODS.calculate_quantum_enhancements = noop
+    SMODS.calculate_card_areas = noop
+    SMODS.calculate_effect = noop
+    SMODS.calculate_repetitions = function(card, context, reps)
+        for _ = 2, card.test_repetitions or 1 do reps[#reps + 1] = {seals = {card = card}} end
+    end
+    SMODS.trigger_effects = function(effects) return {calculated = effects.active or (effects[1] or {}).active}, nil, 'preserved' end
+    percent, percent_delta = 0, 0.1
     SMODS.calculate_individual_effect = function(effect, scored_card, key, amount)
         if key == 'dollars' or key == 'p_dollars' or key == 'h_dollars' then ease_dollars(amount); return true end
         return false
@@ -122,12 +136,17 @@ check_and_set_high_score('hand', 100)
 check_and_set_high_score('hand', 350)
 assert(#s.blinds == 1 and s.blinds[1].best == 350)
 assert(s.blinds[1].target == 300 and s.blinds[1].label == '1S')
+G.GAME.chips = 450
+assert(RS.score_chart_data().series[3].name == 'Total round score')
+assert(RS.score_chart_data().series[3].values[1] == 450, 'live round total includes all hands')
 G.GAME.blind:set_blind({name = 'Small'}, true)
 assert(#s.blinds == 1, 'reset must not create history')
 set_hand_usage('Pair'); set_hand_usage('Pair'); set_hand_usage('Flush')
 assert(RS.poker_chart_data().series[1].values[1] == 2)
 win(2, 2)
 assert(s.blinds[1].won and s.blinds[1].completed)
+assert(s.blinds[1].total_score == 300 and RS.score_chart_data().series[3].values[1] == 300,
+    'completed total uses actual round chips, including adjustments, rather than summed hands')
 assert(RS.hands_chart_data().series[2].values[1] == 2)
 shop(12); shop(99)
 assert(#s.shops == 1 and s.shops[1].cash == 12, 'shop re-entry must not replace entry cash')
@@ -146,11 +165,13 @@ G.GAME.chips = 50
 G.GAME.current_round.hands_played = 4
 end_round()
 assert(not s.blinds[3].won and #RS.hands_chart_data().antes == 2, 'failed blinds are not wins')
+assert(RS.score_chart_data().series[3].values[3] == 50, 'failed rounds retain their total')
 RS._ante_sel = 1
 assert(#RS.score_chart_data().antes == 2 and #RS.cash_chart_data().antes == 2)
 assert(#RS.poker_chart_data().antes == 2)
 RS._ante_sel = 2
 assert(#RS.hands_chart_data().antes == 0)
+assert(#RS.score_chart_data().series[3].values == 1 and RS.score_chart_data().series[3].values[1] == 50)
 assert(RS.poker_chart_data().antes[1] == 'High Card')
 assert(RS.ante_in_progress(2) and not RS.ante_in_progress(1))
 local pa = RS.pa()
@@ -172,6 +193,11 @@ local saved = copy(s)
 G.GAME.run_stats = saved
 s = saved
 assert(RS.stats() == saved and #RS.score_chart_data().antes == 3)
+assert(RS.score_chart_data().series[3].values[1] == 300, 'round totals survive save/load')
+local saved_total = s.blinds[2].total_score
+s.blinds[2].total_score = nil
+assert(RS.score_chart_data().series[3].values[2] == false, 'unrecorded historical totals are gaps')
+s.blinds[2].total_score = saved_total
 shop(90)
 assert(#s.shops == 3)
 -- Old saves have neither history nor per-ante hand types.
@@ -363,7 +389,9 @@ assert(RS.card_chart_data().values[1][1] == 1)
 G.FUNCS.runstats_cards_mode()
 assert(RS._card_mode == 4, 'mode cycles Drawn to Use rate')
 G.FUNCS.runstats_cards_mode()
-assert(RS._card_mode == 1, 'mode cycles Use rate back to Played')
+assert(RS._card_mode == 5, 'mode cycles Use rate to Triggers')
+G.FUNCS.runstats_cards_mode()
+assert(RS._card_mode == 1, 'mode cycles Triggers back to Played')
 G.FUNCS.runstats_cards_mode(); G.FUNCS.runstats_cards_mode()
 assert(RS._card_mode == 3)
 RSCardChart({w = 13.4, h = 4.6, data = RS.card_chart_data}):draw()
@@ -884,6 +912,260 @@ for _, series in ipairs(income_data.series) do
 end
 assert(keys.jokers and keys.cards and keys.sales and sum == select(2, RS.income_summary()))
 RSChart({w = 6.4, h = 3.2, kind = 'stacked', data = RS.income_chart_data}):draw()
+-- Target rolls weight duplicate base cards, exclude Stone cards, and use the
+-- whole current deck (including cards outside the draw pile), not ante slices.
+local saved_cards = G.playing_cards
+local function target_card(suit, rank, effect)
+    return {base = {suit = suit, id = rank}, ability = {effect = effect}}
+end
+G.playing_cards = {
+    target_card('Hearts', 14), target_card('Hearts', 14), target_card('Spades', 2),
+    target_card('Hearts', 3, 'Wild Card'), target_card('Clubs', 5, 'Stone Card'),
+}
+local targets = RS.joker_target_summary()
+assert(targets.total == 5 and targets.idol_total == 4 and targets.castle_total == 4)
+assert(targets.idol[1].suit == 'Hearts' and targets.idol[1].rank == 14)
+assert(targets.idol[1].count == 2 and targets.idol[1].total == 4 and targets.idol[1].percentage == 50)
+assert(#targets.castle == 4 and targets.castle[1].count == 3 and targets.castle[1].percentage == 75)
+RS._tab = 'stats'
+RS.show_menu()
+local menu_text = {}
+local function gather_text(node)
+    if type(node) ~= 'table' then return end
+    if node.config and node.config.text then menu_text[node.config.text] = true end
+    for _, child in ipairs(node.nodes or node.contents or {}) do gather_text(child) end
+end
+gather_text(G.last_overlay)
+assert(menu_text['A Hearts'] and menu_text['2 / 4  (50.0%)'] and menu_text['3 / 4  (75.0%)'])
+RS._ante_sel = 99
+assert(RS.joker_target_summary().idol[1].count == 2, 'target chances always use the current full deck')
+RS._ante_sel = 0
+if SMODS then
+    local old_suit, old_rank = SMODS.has_no_suit, SMODS.has_no_rank
+    SMODS.has_no_suit = function(card) return card.test_no_suit end
+    SMODS.has_no_rank = function(card) return card.test_no_rank end
+    G.playing_cards[1].test_no_rank = true
+    G.playing_cards[3].test_no_suit = true
+    targets = RS.joker_target_summary()
+    assert(targets.idol_total == 2 and targets.castle_total == 3)
+    SMODS.has_no_suit, SMODS.has_no_rank = old_suit, old_rank
+end
+G.playing_cards = {target_card('Clubs', 5, 'Stone Card')}
+targets = RS.joker_target_summary()
+assert(targets.idol_total == 0 and #targets.idol == 0 and targets.castle[1].percentage == 0)
+G.playing_cards = nil
+assert(RS.joker_target_summary().total == 0)
+G.playing_cards = saved_cards
+-- Trigger passes aggregate duplicates by base identity, persist and slice by ante.
+s = fresh()
+local triggered = {base = {suit = 'Hearts', id = 14}, test_active = true, test_repetitions = 3}
+local quiet = {base = {suit = 'Clubs', id = 2}, test_active = false}
+G.play, G.hand = area(), area()
+G.play:emplace(triggered)
+if SMODS then
+    SMODS.score_card(triggered, {cardarea = G.play})
+    local first, hole, last = SMODS.trigger_effects({active = true}, triggered) -- outside the scoring scope
+    assert(first.calculated and hole == nil and last == 'preserved')
+    SMODS.score_card(triggered, {cardarea = 'unscored'})
+else
+    for _ = 1, 3 do RS.record_vanilla_trigger(triggered, 'scoring', {{chips = 11}}) end
+end
+assert(s.per_ante[1].scoring_triggers['Hearts:14'] == 3)
+triggered.debuff = true
+if SMODS then SMODS.score_card(triggered, {cardarea = G.play})
+else RS.record_vanilla_trigger(triggered, 'scoring', {{chips = 11}}) end
+triggered.debuff = nil
+assert(s.per_ante[1].scoring_triggers['Hearts:14'] == 3)
+G.hand:emplace(triggered); G.hand:emplace(quiet)
+triggered.test_repetitions = 1
+if SMODS then
+    SMODS.score_card(triggered, {cardarea = G.hand})
+    SMODS.score_card(quiet, {cardarea = G.hand})
+    SMODS.calculate_end_of_round_effects({cardarea = G.hand, end_of_round = true})
+else
+    RS.record_vanilla_trigger(triggered, 'held', {{x_mult = 1.5}, {mult = 2}})
+    RS.record_vanilla_trigger(quiet, 'held', {{}})
+    RS.record_vanilla_trigger(triggered, 'held', {{h_dollars = 3}})
+end
+assert(s.per_ante[1].held_triggers['Hearts:14'] == 2 and not s.per_ante[1].held_triggers['Clubs:2'])
+G.GAME.round_resets.ante = 2
+RS.record_card_trigger({base = {suit = 'Hearts', id = 14}}, 'held')
+RS._card_mode, RS._card_suit, RS._card_rank, RS._ante_sel = 5, 3, 14, 0
+RS._show_scoring_triggers, RS._show_held_triggers = true, true
+local triggers = RS.card_chart_data()
+assert(triggers.mode == 'Triggers' and triggers.values[1][1] == 6)
+assert(triggers.segments[1][1][1] == 3 and triggers.segments[1][1][2] == 3)
+local shade = RS.trigger_colour(triggers.cols[1], true)
+assert(shade[1] > triggers.cols[1][1] and shade[2] > triggers.cols[1][2], 'held segments retain a lighter suit shade')
+RSCardChart({data = RS.card_chart_data}):draw()
+G.FUNCS.runstats_cards_scoring_triggers()
+assert(RS.card_chart_data().values[1][1] == 3)
+G.FUNCS.runstats_cards_held_triggers()
+assert(RS.card_chart_data().values[1][1] == 0)
+RSCardChart({data = RS.card_chart_data}):draw()
+RS._show_scoring_triggers, RS._show_held_triggers = true, true
+RS._ante_sel = 1
+assert(RS.card_chart_data().values[1][1] == 5)
+G.GAME.run_stats = copy(s)
+assert(RS.card_chart_data().values[1][1] == 5, 'trigger history survives save/load')
+G.GAME.run_stats.per_ante[1].held_triggers = nil
+assert(RS.card_chart_data().values[1][1] == 3, 'old saves have no fabricated trigger counts')
+G.FUNCS.runstats_cards_reset()
+assert(RS._card_mode == 1 and RS._show_scoring_triggers and RS._show_held_triggers)
+-- Shop offers are saved by stock row, not by polling the remaining cards.
+s = fresh()
+G.GAME.shop, G.GAME.used_vouchers = {joker_max = 2}, {}
+G.GAME.selected_back_key = 'b_red'
+G.shop_jokers = area()
+local next_shop_id = 0
+local function offer(set, key, name, rank)
+    next_shop_id = next_shop_id + 1
+    return {sort_id = next_shop_id, config = {center = {key = key, set = set}},
+        ability = {set = set, name = name}, cost = 5,
+        base = rank and {suit = 'Hearts', id = rank} or nil}
+end
+local function stock(cards, reroll)
+    if reroll then RS.capture_shop_stock() end
+    RS.begin_shop_stock(reroll)
+    G.shop_jokers.cards = {}
+    for _, card in ipairs(cards) do G.shop_jokers:emplace(card) end
+    RS.capture_shop_stock()
+end
+local j1, tarot = offer('Joker', 'j_joker', 'Joker'), offer('Tarot', 'c_fool', 'The Fool')
+stock({j1, tarot}, false)
+assert(#s.shop_stock == 1 and #s.shop_stock[1].cards == 2 and s.shop_stock[1].reroll == 0)
+G.shop_jokers:remove_card(j1) -- buying must not remove the sighting
+RS.capture_shop_stock(); RS.begin_shop_stock(false)
+assert(#s.shop_stock == 1 and #s.shop_stock[1].cards == 2)
+local planet = offer('Planet', 'c_pluto', 'Pluto')
+stock({offer('Joker', 'j_joker', 'Joker'), planet}, true)
+assert(s.shop_stock[2].reroll == 1 and RS.shop_frequency('Joker')[1].count == 2)
+assert(RS.shop_frequency('Tarot')[1].name == 'The Fool')
+-- Overstock adds a slot without replacing bought/sold offers or the row.
+G.GAME.shop.joker_max = 3
+G.shop_jokers:emplace(offer('Joker', 'j_joker', 'Joker'))
+assert(#s.shop_stock[2].cards == 3 and s.shop_stock[2].capacity == 3)
+assert(RS.shop_frequency('Joker')[1].count == 3, 'duplicates in one row count separately')
+G.GAME.shop.joker_max = 4
+G.shop_jokers:emplace(offer('Spectral', 'c_hex', 'Hex'))
+assert(#s.shop_stock[2].cards == 4 and s.shop_stock[2].capacity == 4)
+-- A restored row uses saved sort IDs to avoid counting remaining stock twice.
+G.GAME.run_stats = copy(s); s = G.GAME.run_stats
+local restored_cards = {}
+for _, card in ipairs(G.shop_jokers.cards) do
+    restored_cards[#restored_cards + 1] = copy({sort_id = card.sort_id, config = card.config,
+        ability = card.ability, cost = card.cost, base = card.base})
+end
+G.shop_jokers.cards = restored_cards
+RS.begin_shop_stock(false); RS.capture_shop_stock()
+assert(#s.shop_stock == 2 and #s.shop_stock[2].cards == 4)
+G.GAME.round = 2
+G.GAME.round_resets.ante = 2
+stock({offer('Default', 'c_base', 'Base Card', 14), offer('Planet', 'c_pluto', 'Pluto'),
+    offer('Tarot', 'c_fool', 'The Fool'), offer('Spectral', 'c_hex', 'Hex')}, false)
+assert(s.shop_stock[3].reroll == 0 and s.shop_stock[3].ante == 2)
+RS._ante_sel = 1
+assert(RS.shop_frequency('Planet')[1].count == 1 and #RS.shop_frequency('Playing') == 0)
+RS._ante_sel = 2
+assert(RS.shop_frequency('Playing')[1].key == 'Hearts:14')
+RS._ante_sel = 0
+local pages = RS.shop_history_pages()
+assert(#pages == 1 and pages[1][1].group == s.shop_stock[3], 'history starts with newest stock')
+for roll = 1, 6 do stock({offer('Joker', 'j_' .. roll, 'Joker ' .. roll),
+    offer('Planet', 'c_pluto', 'Pluto'), offer('Tarot', 'c_fool', 'The Fool'),
+    offer('Joker', 'j_joker', 'Joker')}, true) end
+pages = RS.shop_history_pages()
+assert(#pages == 3)
+for _, page in ipairs(pages) do
+    local count = 0
+    for _, pane in ipairs(page) do count = count + pane.last - pane.first + 1 end
+    assert(count <= 12, 'each page holds at most 12 offers and preserves stock rows')
+end
+assert(#RS.shop_frequency('Joker') == 5 and RS.shop_frequency('Joker')[1].key == 'j_joker')
+RS._shop_view = 'history'
+G.FUNCS.runstats_tab_shop()
+assert(RS._shop_page == 1 and RS._tab == 'shop')
+G.FUNCS.runstats_shop_older(); assert(RS._shop_page == 2)
+G.FUNCS.runstats_shop_older(); G.FUNCS.runstats_shop_older(); assert(RS._shop_page == 3)
+RS._ante_sel = 1
+RS.show_menu(); assert(RS._shop_page == 1, 'ante changes clamp old page selections')
+G.FUNCS.runstats_shop_view()
+assert(RS._shop_view == 'frequency')
+G.FUNCS.runstats_shop_category(); assert(RS._shop_category == 'Planet')
+-- Category availability before any conditional offers have appeared.
+s = fresh()
+assert(#RS.shop_categories() == 3)
+G.GAME.used_vouchers = {v_magic_trick = true}
+assert(RS.shop_categories()[4] == 'Playing')
+G.GAME.selected_back_key = 'b_ghost'
+assert(RS.shop_categories()[5] == 'Spectral')
+s.shop_stock = nil -- pre-tracking saves
+assert(#RS.shop_history_pages() == 0 and #RS.shop_frequency('Joker') == 0)
+RS._shop_view, RS._shop_category = 'history', 'Joker'
+G.FUNCS.runstats_tab_shop()
+s = fresh()
+G.shop_jokers, G.shop_vouchers = area(), area()
+G.GAME.shop = {joker_max = 4}
+local foil = offer('Joker', 'j_joker', 'Joker'); foil.edition = {foil = true}
+local holo = offer('Tarot', 'c_fool', 'The Fool'); holo.edition = {type = 'holo'}
+local negative = offer('Joker', 'j_abstract', 'Abstract Joker'); negative.edition = {negative = true}
+stock({foil, holo, negative, offer('Planet', 'c_pluto', 'Pluto')}, false)
+local offers = s.shop_stock[1].cards
+assert(offers[1].edition == 'foil' and offers[2].edition == 'holo' and offers[3].edition == 'negative' and offers[4].edition == 'base')
+assert(RS.shop_edition_label('holo') == 'Holographic' and RS.shop_edition_label('polychrome') == 'Polychrome')
+assert(RS.shop_edition_label(nil) == 'Not recorded', 'old offers must not invent an edition')
+RS._shop_view = 'history'; G.FUNCS.runstats_tab_shop()
+for i = 4, #G.last_overlay.contents do assert(#G.last_overlay.contents[i].nodes == 1, 'history panes form one column') end
+menu_text = {}; gather_text(G.last_overlay)
+assert(menu_text['Joker  [Foil]   $5'] and menu_text['The Fool  [Holographic]   $5'])
+local voucher = offer('Voucher', 'v_overstock_norm', 'Overstock')
+voucher.shop_voucher = true
+G.shop_vouchers:emplace(voucher)
+assert(#s.shop_vouchers[1] == 1 and not s.shop_vouchers[1][1].bought)
+RS.capture_shop_stock(); RS.capture_shop_vouchers()
+assert(#s.shop_vouchers[1] == 1, 'revisits and rerolls do not duplicate the same ante voucher')
+voucher.cost = 0
+RS.record_shop_voucher(voucher, true)
+RS.capture_shop_vouchers()
+assert(s.shop_vouchers[1][1].bought and s.shop_vouchers[1][1].paid == 0, 'free redemption counts as bought and stays bought')
+local external = offer('Voucher', 'v_external', 'External voucher')
+RS.record_shop_voucher(external, true)
+assert(#s.shop_vouchers[1] == 1, 'out-of-shop redemptions are not shop offers')
+local voucher_area = G.shop_vouchers
+G.shop_vouchers = nil
+RS.record_shop_voucher(external, true)
+assert(#s.shop_vouchers[1] == 1, 'redemptions with no shop area must not count as shop offers')
+G.shop_vouchers = voucher_area
+-- Voucher refresh belongs to the new ante, even when cash/stock is attributed
+-- to the Boss blind that led into the shop.
+s.blinds = {{ante = 1, label = '1BOSS', completed = true}}
+s.current_blind = 1
+G.GAME.round_resets.ante = 2
+G.shop_vouchers.cards = {}
+G.shop_vouchers:emplace(offer('Voucher', 'v_overstock_norm', 'Overstock'))
+assert(#s.shop_vouchers[2] == 1 and not s.shop_vouchers[2][1].bought and s.shop_vouchers[1][1].bought)
+G.GAME.run_stats = copy(s); s = G.GAME.run_stats
+assert(s.shop_vouchers[1][1].bought and s.shop_vouchers[1][1].paid == 0)
+RS._ante_sel = 1
+local voucher_pages = RS.voucher_history_pages()
+assert(#voucher_pages[1] == 1 and voucher_pages[1][1].voucher.bought)
+RS._ante_sel = 0
+G.FUNCS.runstats_shop_view(); G.FUNCS.runstats_shop_view()
+assert(RS._shop_view == 'vouchers')
+menu_text = {}; gather_text(G.last_overlay)
+assert(menu_text['Overstock   $0   |   Bought'] and menu_text['Overstock   $5   |   Not bought'])
+for ante = 3, 10 do
+    G.GAME.round_resets.ante = ante
+    RS.record_shop_voucher(offer('Voucher', 'v_' .. ante, 'Voucher ' .. ante), false)
+end
+voucher_pages = RS.voucher_history_pages()
+assert(#voucher_pages == 2 and #voucher_pages[1] == 8 and voucher_pages[1][1].ante == 10)
+G.FUNCS.runstats_shop_older(); assert(RS._voucher_page == 2)
+G.FUNCS.runstats_shop_newer(); assert(RS._voucher_page == 1)
+G.FUNCS.runstats_shop_view(); assert(RS._shop_view == 'history')
+print('Shop checks passed: visits, rerolls, purchases, duplicate offers, Overstock sizes, restored stock, pagination, top five, categories, editions, voucher offers/redemptions and ante filters')
+print('Trigger checks passed: scoring, repetitions, held effects, end-of-round effects, filters, suit shades, saves and rendering')
+print('Joker target checks passed: duplicates, full deck, Wild/Stone cards, empty pools and optional enhancement exclusions')
 print('Dashboard checks passed: hooks, saves, filtering, menus, six charts and draw paths')
 print('Pack and result-screen checks passed: all five families/sizes, free packs, old saves, win/loss navigation')
 print('Drawn-card checks passed: completed transfers, repeated draws, exclusions, filters, mode cycle and old saves')
