@@ -10,6 +10,7 @@ import tomllib
 root = Path(__file__).resolve().parents[1]
 entries = tomllib.loads((root / 'lovely/patches.toml').read_text())['patches']
 patches = [entry['pattern'] for entry in entries if 'pattern' in entry]
+regex_patches = [entry['regex'] for entry in entries if 'regex' in entry]
 modules = [entry['module'] for entry in entries if 'module' in entry]
 assert len(modules) == 1 and modules[0]['name'] == 'runstats.runtime' and modules[0]['before'] == 'main.lua'
 assert (root / modules[0]['source']).is_file()
@@ -37,6 +38,20 @@ with tempfile.TemporaryDirectory(prefix='runstats-patches-') as temp:
                 assert patch['position'] == 'after'
                 return match[0] + '\n' + payload
             targets[target] = pattern.sub(replace, text)
+        for patch in regex_patches:
+            target = patch['target']
+            text = targets.get(target, (source / target).read_text())
+            expression = re.sub(r'\(\?<([a-z_]+)>', r'(?P<\1>', patch['pattern'])
+            pattern = re.compile(expression)
+            matches = list(pattern.finditer(text))
+            if label == 'vanilla' or target == 'card.lua':
+                assert matches, (label, target, 'missing income payment sites')
+            def replace_regex(match):
+                payload = re.sub(r'\$([a-z_]+)', lambda name: match[name[1]] or '', patch['payload'])
+                prepend = re.sub(r'\$([a-z_]+)', lambda name: match[name[1]] or '', patch.get('line_prepend', ''))
+                assert patch['position'] == 'at'
+                return '\n'.join(prepend + line for line in payload.splitlines())
+            targets[target] = pattern.sub(replace_regex, text)
         for target, text in targets.items():
             path = Path(temp) / label / target
             path.parent.mkdir(parents=True, exist_ok=True)
@@ -70,7 +85,7 @@ local values, total = RS.spending_summary()
 assert(total == 26 and values.jokers == 7 and values.rerolls == 4 and values.packs == 5 and values.vouchers == 10 and values.other == 0)
 print('Lovely patch checks passed: vanilla and installed source targets, Lua compilation and exact charge payloads')
 """
-income_patches = [p for p in patches if 'prepare_cashout_income' in p['payload'] or 'record_income' in p['payload']]
+income_patches = [p for p in patches if 'prepare_cashout_income' in p['payload'] or "prepare_income('sales')" in p['payload']]
 script += """
 G.GAME.run_stats = RS.fresh_stats()
 G.GAME.round_resets.ante = 1
@@ -81,11 +96,26 @@ for patch in income_patches:
     if 'prepare_cashout_income' in patch['payload']:
         script += patch['payload'] + "\nease_dollars(12)\n"
     else:
-        script += "do local self = {sell_cost = 7}; ease_dollars(self.sell_cost); " + patch['payload'] + " end\n"
+        script += "do local self = {sell_cost = 7}; " + patch['payload'] + "; ease_dollars(self.sell_cost) end\n"
 script += """
 local income, total = RS.income_summary()
 assert(total == 19 and income.blinds == 5 and income.hands == 2 and income.interest == 3 and income.sales == 7 and income.other == 2)
 print('Income patch checks passed: actual cash-out preparation and sale-credit payloads')
+"""
+card_payment = next(p['payload'] for p in regex_patches if p['target'] == 'card.lua')
+effect_payment = next(p['payload'] for p in regex_patches if p['target'] == 'functions/state_events.lua')
+script += """
+G.GAME.run_stats = RS.fresh_stats()
+G.GAME.round_resets.ante = 1
+"""
+for kind, amount in [('Joker', 9), ('Tarot', 4)]:
+    script += f"do local self = {{ability = {{set = '{kind}', extra = {amount}}}}}; " + card_payment.replace('$args', 'self.ability.extra') + " end\n"
+for effect, amount in [("{card = {ability = {set = 'Joker'}}}", 6), ('{}', 3)]:
+    script += f"do local effects = {{{effect}}}; local ii = 1; effects[ii].dollars = {amount}; " + effect_payment.replace('$args', 'effects[ii].dollars') + " end\n"
+script += """
+local income, total = RS.income_summary()
+assert(total == 22 and income.jokers == 15 and income.cards == 7 and income.other == 0)
+print('Income source patches passed: direct/deferred card payments and returned vanilla effects')
 """
 bootstrap = next(p['payload'] for p in patches if 'runstats.runtime' in p['payload'])
 script += f"local boot = assert(loadstring({json.dumps(bootstrap)}))\n"

@@ -277,6 +277,41 @@ local function safe_wrap(obj, key, make_new)
     return ref
 end
 
+-- Effect calculations may run in a scoring coroutine. Keep their income source
+-- local to that coroutine so a yield cannot misattribute unrelated payments.
+local income_main_thread = {}
+local income_scopes = setmetatable({}, {__mode = 'k'})
+local function income_thread() return coroutine.running() or income_main_thread end
+local function pack_results(...) return {n = select('#', ...), ...} end
+
+function RS.card_income_category(card)
+    return card and (card.ability or {}).set == 'Joker' and 'jokers' or 'cards'
+end
+
+function RS.with_card_income(card, fn, ...)
+    local thread = income_thread()
+    local previous = income_scopes[thread]
+    income_scopes[thread] = {stats = RS.stats(), category = RS.card_income_category(card)}
+    local result = pack_results(fn(...))
+    income_scopes[thread] = previous
+    return unpack(result, 1, result.n)
+end
+
+function RS.with_effect_income(effect, fn, ...)
+    effect = effect or {}
+    return RS.with_card_income(effect.card or effect.juice_card or effect.focus, fn, ...)
+end
+
+safe_wrap(SMODS, 'calculate_individual_effect', function(ref)
+    return function(effect, scored_card, key, amount, ...)
+        if key == 'dollars' or key == 'p_dollars' or key == 'h_dollars' then
+            local source = effect and (effect.card or effect.juice_card or effect.focus) or nil
+            return RS.with_card_income(source or scored_card, ref, effect, scored_card, key, amount, ...)
+        end
+        return ref(effect, scored_card, key, amount, ...)
+    end
+end)
+
 local function score_summary(scores)
     local sorted, total = {}, 0
     for _, score in ipairs(scores or {}) do sorted[#sorted + 1], total = score, total + score end
@@ -412,6 +447,8 @@ safe_wrap(_G, 'add_round_eval_row', function(ref)
         local payout = stats and stats.round_income
         if payout and config and type(config.dollars) == 'number' and config.dollars > 0 then
             local category = ({blind1 = 'blinds', hands = 'hands', interest = 'interest'})[config.name]
+            if not category and config.card then category = RS.card_income_category(config.card) end
+            if not category and type(config.name) == 'string' and config.name:match('^joker%d+$') then category = 'jokers' end
             if category then bump(payout.categories, category, config.dollars) end
         end
         return ref(config, ...)
@@ -425,6 +462,11 @@ function RS.prepare_cashout_income()
             or { ante = snapshot_ante() or current_ante(), categories = {} } }
         stats.round_income = nil
     end
+end
+
+function RS.prepare_income(category)
+    local stats = RS.stats()
+    if stats then RS._next_income = {stats = stats, category = category} end
 end
 
 function RS.record_income(category, amount)
@@ -441,7 +483,8 @@ function RS.income_summary()
             for key, value in pairs(bucket.income or {}) do bump(totals, key, value) end
         end
     end
-    local known = (totals.blinds or 0) + (totals.hands or 0) + (totals.interest or 0) + (totals.sales or 0)
+    local known = (totals.blinds or 0) + (totals.hands or 0) + (totals.interest or 0)
+        + (totals.sales or 0) + (totals.jokers or 0) + (totals.cards or 0)
     totals.other = math.max(0, earned - known)
     return totals, earned
 end
@@ -690,7 +733,15 @@ safe_wrap(_G, 'ease_dollars', function(ref)
                     pa.income = pa.income or {}
                     for category, value in pairs(payout.categories) do bump(pa.income, category, value) end
                 end
-            else pa = RS.pa() or new_pa() end
+            else
+                pa = RS.pa() or new_pa()
+                if mod > 0 then
+                    local scope = income_scopes[income_thread()]
+                    local category = pending and pending.stats == s and pending.category
+                        or (scope and scope.stats == s and scope.category)
+                    if category then pa.income = pa.income or {}; bump(pa.income, category, mod) end
+                end
+            end
             if mod < 0 then
                 s.money_spent = s.money_spent - mod
                 pa.spent = (pa.spent or 0) - mod
@@ -989,13 +1040,19 @@ function RSChart:draw()
     local horizontal = cfg.kind == 'horizontal'
     local stacked = cfg.kind == 'stacked'
     local left, right, top, bottom = horizontal and 1.45 or 0.58, 0.2, 0.32, 0.3
-    local legend_x, legend_rows = 0.08, 1
-    for _, ser in ipairs(series) do
-        local width = 0.2 + self.font.FONT:getWidth(ser.name) * (0.18 * self.font.FONTSCALE / G.TILESIZE)
-        if legend_x + width > w and legend_x > 0.08 then legend_x, legend_rows = 0.08, legend_rows + 1 end
-        legend_x = legend_x + width + 0.12
-    end
-    top = 0.17 + legend_rows * 0.15
+    local legend_scale, legend_step, legend_rows, legend_widest = 0.18, 0.15, 1, 0
+    repeat
+        local legend_x = 0.08
+        legend_rows, legend_step, legend_widest = 1, legend_scale * 0.84, 0
+        for _, ser in ipairs(series) do
+            local width = 0.2 + self.font.FONT:getWidth(ser.name) * (legend_scale * self.font.FONTSCALE / G.TILESIZE)
+            legend_widest = math.max(legend_widest, width)
+            if legend_x + width > w and legend_x > 0.08 then legend_x, legend_rows = 0.08, legend_rows + 1 end
+            legend_x = legend_x + width + 0.12
+        end
+        top = 0.17 + legend_rows * legend_step
+        if top > h * 0.55 or legend_widest > w - 0.08 then legend_scale = legend_scale * 0.85 end
+    until top <= h * 0.55 and legend_widest <= w - 0.08
     local pw, ph = w - left - right, h - top - bottom
     local function transform(v)
         return cfg.log and math.log10(math.max(0, v) + 1) or v
@@ -1037,11 +1094,11 @@ function RSChart:draw()
     -- Reserve plot space for every wrapped legend row.
     local lx, ly = 0.08, 0.02
     for _, ser in ipairs(series) do
-        local width = 0.2 + self.font.FONT:getWidth(ser.name) * (0.18 * self.font.FONTSCALE / G.TILESIZE)
-        if lx + width > w and lx > 0.08 then lx, ly = 0.08, ly + 0.15 end
+        local width = 0.2 + self.font.FONT:getWidth(ser.name) * (legend_scale * self.font.FONTSCALE / G.TILESIZE)
+        if lx + width > w and lx > 0.08 then lx, ly = 0.08, ly + legend_step end
         graphics.setColor(ser.colour)
         graphics.rectangle('fill', lx, ly + 0.02, 0.09, 0.09)
-        self:_text(ser.name, lx + 0.13, ly, 0.18, {1, 1, 1, 0.85})
+        self:_text(ser.name, lx + 0.13, ly, legend_scale, {1, 1, 1, 0.85})
         lx = lx + width + 0.12
     end
     if horizontal then
@@ -1068,18 +1125,30 @@ function RSChart:draw()
         if cfg.kind == 'line' then
             local original_line_width = graphics.getLineWidth()
             graphics.setLineWidth(0.022)
-            for _, ser in ipairs(series) do
-                local previous
-                graphics.setColor(ser.colour)
-                for i = 1, #labels do
-                    local v = ser.values[i]
-                    if type(v) == 'number' then
-                        local px, py = x(i), y(v)
-                        if previous then graphics.line(previous[1], previous[2], px, py) end
-                        graphics.circle('fill', px, py, 0.027)
-                        previous = {px, py}
-                    else
-                        previous = nil -- missing history is a gap, never a zero
+            if data.segments then
+                for _, segment in ipairs(data.segments) do
+                    graphics.setColor(series[segment.series].colour)
+                    graphics.line(x(segment.i), y(segment.from), x(segment.j), y(segment.to))
+                end
+                for _, point in ipairs(data.points or {}) do
+                    graphics.setColor(series[point.series].colour)
+                    if #labels == 1 then graphics.line(left + pw * 0.15, y(point.value), left + pw * 0.85, y(point.value)) end
+                    graphics.circle('fill', x(point.i), y(point.value), 0.032)
+                end
+            else
+                for _, ser in ipairs(series) do
+                    local previous
+                    graphics.setColor(ser.colour)
+                    for i = 1, #labels do
+                        local v = ser.values[i]
+                        if type(v) == 'number' then
+                            local px, py = x(i), y(v)
+                            if previous then graphics.line(previous[1], previous[2], px, py) end
+                            graphics.circle('fill', px, py, 0.027)
+                            previous = {px, py}
+                        else
+                            previous = nil -- missing history is a gap, never a zero
+                        end
                     end
                 end
             end
@@ -1685,12 +1754,17 @@ local function analysis_summary()
 end
 
 local INCOME_CATEGORIES = {
-    {key = 'blinds', label = 'Blinds'}, {key = 'hands', label = 'Unused hands'},
-    {key = 'interest', label = 'Interest'}, {key = 'sales', label = 'Sales'}, {key = 'other', label = 'Other'},
+    {key = 'blinds', label = 'Blinds', colour = {0.12, 0.55, 1, 1}},
+    {key = 'hands', label = 'Unused hands', colour = {0.2, 0.78, 0.38, 1}},
+    {key = 'interest', label = 'Interest', colour = {1, 0.8, 0.12, 1}},
+    {key = 'jokers', label = 'Jokers', colour = {1, 0.42, 0.12, 1}},
+    {key = 'cards', label = 'Cards', colour = {0.98, 0.35, 0.65, 1}},
+    {key = 'sales', label = 'Sales', colour = {0.65, 0.4, 0.95, 1}},
+    {key = 'other', label = 'Other', colour = {0.64, 0.7, 0.75, 1}},
 }
 local DECK_MODES = { 'Suits', 'Ranks', 'Enhancements', 'Seals', 'Editions' }
 local DECK_FIELDS = { 'suits', 'ranks', 'enhancements', 'seals', 'editions' }
-RS._deck_mode, RS._level_hand = 1, 0
+RS._deck_mode = 1
 
 local function category_colour(i)
     return ({G.C.BLUE, G.C.GREEN, G.C.MONEY, G.C.PURPLE, G.C.ORANGE})[(i - 1) % 5 + 1]
@@ -1699,65 +1773,147 @@ end
 function RS.income_chart_data()
     local labels, series = {}, {}
     for i, category in ipairs(INCOME_CATEGORIES) do
-        series[i] = series_of(category.label, category_colour(i), {})
+        series[i] = series_of(category.label, category.colour, {})
+        series[i].key = category.key
     end
     for _, row in ipairs(pa_list()) do
         if RS.in_slice(row.ante) then
             labels[#labels + 1] = tostring(row.ante) .. (RS.ante_in_progress(row.ante) and '*' or '')
             local income, known = row.bucket.income or {}, 0
-            for i = 1, 4 do
+            for i = 1, #INCOME_CATEGORIES - 1 do
                 local amount = income[INCOME_CATEGORIES[i].key] or 0
                 series[i].values[#labels] = amount
                 known = known + amount
             end
-            series[5].values[#labels] = math.max(0, (row.bucket.earned or 0) - known)
+            series[#INCOME_CATEGORIES].values[#labels] = math.max(0, (row.bucket.earned or 0) - known)
         end
     end
     return {antes = labels, series = series, empty = 'Receive income to start tracking'}
 end
 
+local HAND_ORDER = { 'Flush Five', 'Flush House', 'Five of a Kind', 'Straight Flush',
+    'Four of a Kind', 'Full House', 'Flush', 'Straight', 'Three of a Kind', 'Two Pair', 'Pair', 'High Card' }
+
 function RS.level_hand_options()
-    local seen, options = {}, {}
+    local seen, options, order = {}, {}, {}
+    for index, hand in ipairs(G.handlist or HAND_ORDER) do order[hand] = index end
     for _, row in ipairs(pa_list()) do
         for hand in pairs(row.bucket.hand_levels or {}) do
             if not seen[hand] then seen[hand] = true; options[#options + 1] = hand end
         end
     end
-    table.sort(options)
+    table.sort(options, function(a, b)
+        if (order[a] or 999) == (order[b] or 999) then return a < b end
+        return (order[a] or 999) < (order[b] or 999)
+    end)
     return options
 end
 
+local function hand_group_colour(key)
+    if key == 'baseline' or key == 'all' then return {0.78, 0.83, 0.89, 1} end
+    local hue = 0
+    for i = 1, #key do hue = (hue * 37 + key:byte(i)) % 359 end
+    local h, c, m = hue / 60, 0.7, 0.25
+    local x = c * (1 - math.abs(h % 2 - 1))
+    local rgb = ({ {c,x,0}, {x,c,0}, {0,c,x}, {0,x,c}, {x,0,c}, {c,0,x} })[math.floor(h) + 1]
+    return {rgb[1] + m, rgb[2] + m, rgb[3] + m, 1}
+end
+
 function RS.hand_levels_chart_data()
-    local options, usage, latest = RS.level_hand_options(), {}, {}
-    for _, row in ipairs(pa_list()) do
-        if RS.in_slice(row.ante) then
-            for hand, count in pairs(row.bucket.hand_types or {}) do bump(usage, hand, count) end
-            for hand, level in pairs(row.bucket.hand_levels or {}) do latest[hand] = level end
-        end
-    end
-    local chosen = options[RS._level_hand or 0]
-    if chosen then options = {chosen}
-    else
-        table.sort(options, function(a, b)
-            if (usage[a] or 0) ~= (usage[b] or 0) then return (usage[a] or 0) > (usage[b] or 0) end
-            if (latest[a] or 0) ~= (latest[b] or 0) then return (latest[a] or 0) > (latest[b] or 0) end
-            return a < b
-        end)
-        while #options > 3 do table.remove(options) end
-    end
-    local labels, series, any = {}, {}, false
-    for i, hand in ipairs(options) do series[i] = series_of(localize(hand, 'poker_hands'), category_colour(i), {}) end
+    local options, labels, hands = RS.level_hand_options(), {}, {}
+    for _, hand in ipairs(options) do hands[hand] = {} end
+    local any, all_same = false, true
     for _, row in ipairs(pa_list()) do
         if RS.in_slice(row.ante) then
             labels[#labels + 1] = tostring(row.ante) .. (RS.ante_in_progress(row.ante) and '*' or '')
-            for i, hand in ipairs(options) do
-                local level = (row.bucket.hand_levels or {})[hand]
-                series[i].values[#labels] = level or false
-                if level ~= nil then any = true end
+            local common, present = nil, 0
+            for _, hand in ipairs(options) do
+                local value = (row.bucket.hand_levels or {})[hand]
+                hands[hand][#labels] = value or false
+                if value ~= nil then
+                    any, present = true, present + 1
+                    if common == nil then common = value elseif value ~= common then all_same = false end
+                end
             end
+            if present > 0 and present < #options then all_same = false end
         end
     end
-    return {antes = any and labels or {}, series = series, empty = 'Hand levels appear after tracking starts'}
+    local data = {antes = any and labels or {}, series = {}, segments = {}, points = {}, hands = hands,
+        empty = 'Hand levels appear after tracking starts'}
+    if not any then return data end
+    if all_same and #options > 1 then
+        local values = hands[options[1]]
+        data.series[1] = series_of('All hands', hand_group_colour('all'), values)
+        for i, value in ipairs(values) do
+            if type(value) == 'number' then
+                data.points[#data.points + 1] = {series = 1, i = i, value = value, hands = options}
+                if type(values[i + 1]) == 'number' then
+                    data.segments[#data.segments + 1] = {series = 1, i = i, j = i + 1, from = value, to = values[i + 1], hands = options}
+                end
+            end
+        end
+        return data
+    end
+    local registry = {}
+    local function group_series(group, first, last)
+        local key, name
+        if #group > 1 and first == 1 and (last == nil or last == 1) then
+            key, name = 'baseline', 'Other hands'
+        elseif #group > 1 and #group == #options then
+            key, name = 'all', 'All hands'
+        else
+            key = table.concat(group, '\31')
+            local names = {}
+            for _, hand in ipairs(group) do names[#names + 1] = localize(hand, 'poker_hands') end
+            name = table.concat(names, ' + ')
+        end
+        if not registry[key] then
+            local values = {}
+            for i = 1, #labels do values[i] = false end
+            data.series[#data.series + 1] = series_of(name, hand_group_colour(key), values)
+            registry[key] = #data.series
+        end
+        return registry[key]
+    end
+    -- Shared points are drawn last, so the combined colour is visible at merges.
+    for i = 1, #labels do
+        local groups, levels = {}, {}
+        for _, hand in ipairs(options) do
+            local value = hands[hand][i]
+            if type(value) == 'number' then
+                if not groups[value] then groups[value] = {}; levels[#levels + 1] = value end
+                groups[value][#groups[value] + 1] = hand
+            end
+        end
+        table.sort(levels)
+        for _, value in ipairs(levels) do
+            local group = groups[value]
+            local si = group_series(group, value)
+            data.series[si].values[i] = value
+            data.points[#data.points + 1] = {series = si, i = i, value = value, hands = group}
+        end
+    end
+    -- Group each interval independently: hands can split and rejoin later.
+    for i = 1, #labels - 1 do
+        local groups, keys = {}, {}
+        for _, hand in ipairs(options) do
+            local first, last = hands[hand][i], hands[hand][i + 1]
+            if type(first) == 'number' and type(last) == 'number' then
+                local key = tostring(first) .. ':' .. tostring(last)
+                if not groups[key] then groups[key] = {first = first, last = last, hands = {}}; keys[#keys + 1] = key end
+                groups[key].hands[#groups[key].hands + 1] = hand
+            end
+        end
+        table.sort(keys)
+        for _, key in ipairs(keys) do
+            local group = groups[key]
+            local si = group_series(group.hands, group.first, group.last)
+            data.series[si].values[i], data.series[si].values[i + 1] = group.first, group.last
+            data.segments[#data.segments + 1] = {series = si, i = i, j = i + 1,
+                from = group.first, to = group.last, hands = group.hands}
+        end
+    end
+    return data
 end
 
 local function deck_label(key, field)
@@ -2107,11 +2263,6 @@ G.FUNCS.runstats_trend_view = function()
     RS.show_menu()
 end
 
-G.FUNCS.runstats_level_hand = function()
-    RS._level_hand = ((RS._level_hand or 0) + 1) % (#RS.level_hand_options() + 1)
-    RS.show_menu()
-end
-
 G.FUNCS.runstats_deck_mode = function()
     RS._deck_mode = (RS._deck_mode or 1) % #DECK_MODES + 1
     RS.show_menu()
@@ -2159,11 +2310,7 @@ local function trend_controls()
         label = { 'View: ' .. (TREND_LABELS[RS._trend_view] or 'Overview') },
         button = 'runstats_trend_view', minw = 3, minh = 0.4, scale = 0.3, colour = G.C.BLUE, col = true,
     } }
-    if RS._trend_view == 'economy' then
-        local hand = RS.level_hand_options()[RS._level_hand or 0]
-        nodes[#nodes + 1] = UIBox_button{label = { 'Hand: ' .. (hand and localize(hand, 'poker_hands') or 'Top 3') },
-            button = 'runstats_level_hand', minw = 3.4, minh = 0.4, scale = 0.3, colour = G.C.PURPLE, col = true}
-    elseif RS._trend_view == 'deck' then
+    if RS._trend_view == 'deck' then
         nodes[#nodes + 1] = UIBox_button{label = { 'Group: ' .. DECK_MODES[RS._deck_mode or 1] },
             button = 'runstats_deck_mode', minw = 3.4, minh = 0.4, scale = 0.3, colour = G.C.GREEN, col = true}
     end

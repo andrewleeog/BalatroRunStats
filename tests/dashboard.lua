@@ -33,6 +33,12 @@ Blind = {
 }
 if vanilla_mode then SMODS = nil
 else SMODS = {pseudorandom_probability = function(_, seed) return pseudorandom(seed) < 1 end} end
+if SMODS then
+    SMODS.calculate_individual_effect = function(effect, scored_card, key, amount)
+        if key == 'dollars' or key == 'p_dollars' or key == 'h_dollars' then ease_dollars(amount); return true end
+        return false
+    end
+end
 Moveable = {}
 function Moveable:extend()
     local class = setmetatable({}, {__index = self})
@@ -661,13 +667,13 @@ assert(earned == 0 and not income.interest, 'unclaimed rewards are not income')
 assert(s.round_income.ante == 1)
 RS.prepare_cashout_income(); ease_dollars(15)
 income, earned = RS.income_summary()
-assert(earned == 15 and income.blinds == 5 and income.hands == 3 and income.interest == 4 and income.other == 3)
+assert(earned == 15 and income.blinds == 5 and income.hands == 3 and income.interest == 4 and income.jokers == 2 and income.other == 1)
 assert(s.per_ante[1].earned == 15 and s.per_ante[2] == nil, 'boss payout is credited to the blind ante')
 ease_dollars(7); RS.record_income('sales', 7)
 ease_dollars(3)
 RS.record_income('sales', 0); RS.record_income('sales', -2)
 income, earned = RS.income_summary()
-assert(earned == 25 and income.sales == 7 and income.other == 6)
+assert(earned == 25 and income.sales == 7 and income.other == 4)
 local income_data = RS.income_chart_data()
 for index, ante in ipairs({1, 2}) do
     local sum = 0
@@ -723,13 +729,9 @@ RS.capture_snapshot()
 assert(s.per_ante[1].hand_levels.Pair == 4 and s.per_ante[2].hand_levels.Pair == 5)
 assert(s.per_ante[1].deck_snapshot.total == 6 and s.per_ante[2].deck_snapshot.total == 7)
 s.per_ante[1].hand_types = {Pair = 10, Flush = 4, ['High Card'] = 3, Straight = 1}
-RS._level_hand = 0
 local levels = RS.hand_levels_chart_data()
-assert(#levels.series == 3 and levels.series[1].name == 'Pair' and levels.series[1].values[1] == 4 and levels.series[1].values[2] == 5)
-local options = RS.level_hand_options()
-for index, hand in ipairs(options) do if hand == 'Flush' then RS._level_hand = index end end
-levels = RS.hand_levels_chart_data()
-assert(#levels.series == 1 and levels.series[1].values[1] == 0, 'level zero is a real value, not missing data')
+assert(levels.hands.Pair[1] == 4 and levels.hands.Pair[2] == 5 and levels.hands.Straight[1] == 1)
+assert(levels.hands.Flush[1] == 0, 'level zero is a real value, not missing data')
 for mode = 1, 5 do
     RS._deck_mode = mode
     local history, breakdown = RS.deck_history_chart_data(), RS.deck_breakdown_chart_data()
@@ -745,7 +747,7 @@ for mode = 1, 5 do
 end
 RS._ante_sel = 1
 assert(RS.deck_breakdown_chart_data().ante == 1 and RS.deck_breakdown_chart_data().total == 6)
-assert(RS.hand_levels_chart_data().series[1].values[1] == 0)
+assert(RS.hand_levels_chart_data().hands.Flush[1] == 0)
 RS._ante_sel = 0
 G.GAME.run_stats = copy(s); s = G.GAME.run_stats
 assert(s.per_ante[1].deck_snapshot.total == 6 and s.per_ante[2].hand_levels.Pair == 5, 'snapshots survive save/load')
@@ -757,9 +759,8 @@ assert(#RS.hand_levels_chart_data().antes == 0)
 RS._ante_sel = 0
 RS._trend_view = 'economy'; G.FUNCS.runstats_tab_dash()
 charts, buttons = {}, {}; walk(G.last_overlay)
-assert(#charts == 2 and buttons.runstats_level_hand)
+assert(#charts == 2 and not buttons.runstats_level_hand)
 for _, chart in ipairs(charts) do chart:draw() end
-G.FUNCS.runstats_level_hand()
 G.FUNCS.runstats_trend_view()
 charts, buttons = {}, {}; walk(G.last_overlay)
 assert(RS._trend_view == 'deck' and #charts == 2 and buttons.runstats_deck_mode)
@@ -770,6 +771,119 @@ for mode = 1, 5 do
 end
 G.FUNCS.runstats_trend_view()
 assert(RS._trend_view == 'overview')
+-- Every hand is represented, with shared paths merged at points and intervals.
+s = fresh()
+local poker_hands = {'Flush Five','Flush House','Five of a Kind','Straight Flush','Four of a Kind','Full House',
+    'Flush','Straight','Three of a Kind','Two Pair','Pair','High Card'}
+local function levels_with(overrides)
+    local result = {}
+    for _, hand in ipairs(poker_hands) do result[hand] = 1 end
+    for hand, level in pairs(overrides or {}) do result[hand] = level end
+    return result
+end
+s.per_ante[1] = {career = {}, hand_levels = levels_with()}
+levels = RS.hand_levels_chart_data()
+assert(#levels.series == 1 and levels.series[1].name == 'All hands' and #levels.points[1].hands == 12)
+assert(levels.series[1].values[1] == 1)
+RSChart({w = 6.4, h = 3.2, kind = 'line', data = RS.hand_levels_chart_data}):draw()
+assert(counts.lines == 1, 'one ante still shows the combined horizontal line')
+s.per_ante[2] = {career = {}, hand_levels = levels_with({Flush = 2})}
+levels = RS.hand_levels_chart_data()
+local names = {}
+for _, series in ipairs(levels.series) do names[series.name] = true end
+assert(names['Other hands'] and names.Flush and not names['All hands'])
+s.per_ante[3] = {career = {}, hand_levels = levels_with({Flush = 3, Straight = 2, ['High Card'] = 2})}
+s.per_ante[4] = {career = {}, hand_levels = levels_with({Flush = 4, Straight = 2, ['High Card'] = 2})}
+s.per_ante[5] = {career = {}, hand_levels = levels_with({Flush = 4, Straight = 3, ['High Card'] = 2})}
+s.per_ante[6] = {career = {}, hand_levels = levels_with({Flush = 4, Straight = 3, ['High Card'] = 3})}
+s.per_ante[7] = {career = {}} -- missing snapshot must not bridge a line
+s.per_ante[8] = {career = {}, hand_levels = levels_with({Flush = 4, Straight = 4, ['High Card'] = 4})}
+levels = RS.hand_levels_chart_data()
+names = {}
+for _, series in ipairs(levels.series) do names[series.name] = true end
+assert(names['Straight + High Card'] and names['Flush + Straight + High Card'])
+local saw_shared_interval, saw_split, saw_rejoin = false, false, false
+for _, segment in ipairs(levels.segments) do
+    assert(not (segment.i == 6 or segment.i == 7), 'missing snapshots must break paths')
+    local label = levels.series[segment.series].name
+    if segment.i == 3 and label == 'Straight + High Card' then
+        saw_shared_interval = true
+        assert(segment.from == 2 and segment.to == 2 and #segment.hands == 2)
+    end
+    if segment.i == 4 and label == 'Straight' then saw_split = true end
+    if segment.i == 4 then assert(label ~= 'Straight + High Card', 'do not connect a shared line through a split') end
+end
+for _, point in ipairs(levels.points) do
+    if point.i == 6 and levels.series[point.series].name == 'Straight + High Card' then saw_rejoin = true end
+end
+assert(saw_shared_interval and saw_split and saw_rejoin)
+for index = 1, 8 do
+    local covered = {}
+    for _, point in ipairs(levels.points) do
+        if point.i == index then
+            for _, hand in ipairs(point.hands) do assert(not covered[hand]); covered[hand] = true end
+        end
+    end
+    for _, hand in ipairs(poker_hands) do assert((covered[hand] or false) == (index ~= 7)) end
+end
+RSChart({w = 6.4, h = 3.2, kind = 'line', data = RS.hand_levels_chart_data}):draw()
+RS._ante_sel = 1
+assert(RS.hand_levels_chart_data().series[1].name == 'All hands')
+RS._ante_sel = 3
+levels = RS.hand_levels_chart_data(); names = {}
+for _, series in ipairs(levels.series) do names[series.name] = true end
+assert(names['Straight + High Card'] and names.Flush and names['Other hands'])
+RS._ante_sel = 0
+-- Income scopes identify actual gains, preserve returns and isolate coroutines.
+s = fresh()
+local joker_source = {ability = {set = 'Joker'}}
+local card_source = {ability = {set = 'Tarot'}}
+local a, b, c = RS.with_card_income(joker_source, function() ease_dollars(5); return 4, nil, 'kept' end)
+assert(a == 4 and b == nil and c == 'kept')
+RS.with_card_income(card_source, function() ease_dollars(7) end)
+ease_dollars(2)
+income, earned = RS.income_summary()
+assert(earned == 14 and income.jokers == 5 and income.cards == 7 and income.other == 2)
+RS.with_card_income(joker_source, function() RS.prepare_income('sales'); ease_dollars(4) end)
+RS.with_card_income(joker_source, function() ease_dollars(0); ease_dollars(-3) end)
+income, earned = RS.income_summary()
+assert(earned == 18 and income.sales == 4 and income.jokers == 5 and income.other == 2)
+RS.with_effect_income({card = joker_source}, function() ease_dollars(3) end)
+RS.with_effect_income({}, function() ease_dollars(2) end)
+income = RS.income_summary()
+assert(income.jokers == 8 and income.cards == 9)
+local worker = coroutine.create(function()
+    RS.with_card_income(joker_source, function() coroutine.yield(); ease_dollars(5) end)
+end)
+assert(coroutine.resume(worker))
+ease_dollars(2) -- main thread must not inherit the suspended joker scope
+assert(coroutine.resume(worker))
+income = RS.income_summary()
+assert(income.jokers == 13 and income.other == 4)
+if not vanilla_mode then
+    assert(SMODS.calculate_individual_effect({card = joker_source}, card_source, 'dollars', 6))
+    assert(SMODS.calculate_individual_effect({}, card_source, 'p_dollars', 3))
+    income = RS.income_summary()
+    assert(income.jokers == 19 and income.cards == 12)
+end
+G.test_round_rows = {{name = 'joker1', dollars = 5, card = joker_source},
+    {name = 'custom_card', dollars = 3, card = {ability = {set = 'Enhanced'}}}, {name = 'bottom', dollars = 8}}
+G.FUNCS.evaluate_round()
+local prior_jokers, prior_cards = RS.income_summary().jokers, RS.income_summary().cards
+RS.with_card_income(joker_source, function() RS.prepare_cashout_income(); ease_dollars(8) end)
+income = RS.income_summary()
+assert(income.jokers == prior_jokers + 5 and income.cards == prior_cards + 3, 'cash-out categories override effect scope exactly once')
+income_data = RS.income_chart_data()
+assert(#income_data.series == 7)
+local used_colours, keys, sum = {}, {}, 0
+for _, series in ipairs(income_data.series) do
+    local key = table.concat(series.colour, ',')
+    assert(not used_colours[key], 'income categories must have distinct colours')
+    used_colours[key], keys[series.key] = true, true
+    sum = sum + series.values[1]
+end
+assert(keys.jokers and keys.cards and keys.sales and sum == select(2, RS.income_summary()))
+RSChart({w = 6.4, h = 3.2, kind = 'stacked', data = RS.income_chart_data}):draw()
 print('Dashboard checks passed: hooks, saves, filtering, menus, six charts and draw paths')
 print('Pack and result-screen checks passed: all five families/sizes, free packs, old saves, win/loss navigation')
 print('Drawn-card checks passed: completed transfers, repeated draws, exclusions, filters, mode cycle and old saves')
@@ -778,3 +892,5 @@ if not vanilla_mode then print('Probability checks passed: real tooltip helper, 
 print('Ante selector checks passed: empty runs, played limit, future shop exclusion, endless antes, gaps and stale selections')
 
 print('Economy/deck checks passed: claimed income, ante attribution, snapshots, levels, all deck groupings, save/load, filters and rendering')
+
+print('Overlap/income checks passed: all hands, merges/splits/rejoins/gaps, distinct colours, source scopes, sales and joker/card bonuses')

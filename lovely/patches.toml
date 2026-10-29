@@ -78,6 +78,25 @@ payload = "if RunStats then RunStats.prepare_cashout_income() end"
 [patches.pattern]
 target = "card.lua"
 pattern = "ease_dollars(self.sell_cost)"
-position = "after"
+position = "before"
 match_indent = true
-payload = "if RunStats then RunStats.record_income('sales', self.sell_cost) end"
+payload = "if RunStats then RunStats.prepare_income('sales') end"
+
+# Run at the actual payment sites, including deferred card/joker callbacks.
+[[patches]]
+[patches.regex]
+target = "card.lua"
+pattern = '(?m)^(?<indent>[\t ]*)ease_dollars\((?<args>[^\r\n]+)\)[\t ]*$'
+position = "at"
+line_prepend = '$indent'
+payload = "if RunStats then RunStats.with_card_income(self, function() ease_dollars($args) end) else ease_dollars($args) end"
+
+# Vanilla pays returned effects here. Steamodded replaces these sites and uses
+# the calculate_individual_effect hook instead (zero regex matches is expected).
+[[patches]]
+[patches.regex]
+target = "functions/state_events.lua"
+pattern = '(?m)^(?<indent>[\t ]*)ease_dollars\((?<args>effects\[ii\]\.[a-z_]+)\)[\t ]*$'
+position = "at"
+line_prepend = '$indent'
+payload = "if RunStats then RunStats.with_effect_income(effects[ii], function() ease_dollars($args) end) else ease_dollars($args) end"
