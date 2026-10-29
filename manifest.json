@@ -4,6 +4,6 @@
   "author": ["andrewleeog"],
   "description": "Tracks run statistics, income and spending sources, poker-hand levels, deck composition, booster packs, card use rates and triggers, shop stock and offer frequency, probability hit rates and blind history. Requires Lovely; Steamodded is optional.",
   "prefix": "rs",
-  "version": "1.4.1-dev",
+  "version": "1.5.0",
   "main_file": "BalatroRunStats.lua"
 }
