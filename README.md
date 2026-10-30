@@ -1,4 +1,4 @@
-# Balatro Run Stats
+# PowerBalatro
 
 A Balatro mod by **andrewleeog** for tracking the current run, with summaries, charts, card usage, and probability hit rates.
 
@@ -6,13 +6,14 @@ A Balatro mod by **andrewleeog** for tracking the current run, with summaries, c
 
 Requires [Lovely](https://github.com/ethangreen-dev/lovely-injector). [Steamodded](https://github.com/Steamodded/smods) is optional.
 
-1. Download `BalatroRunStats.zip` from the [latest release](https://github.com/andrewleeog/BalatroRunStats/releases/latest), or clone this repository.
-2. Place the repository's contents in a `BalatroRunStats` folder inside your Balatro `Mods` directory. `manifest.json`, `BalatroRunStats.lua`, and `lovely/` should be directly inside that folder.
-3. Restart Balatro.
+1. Download `BalatroRunStats.zip` from the [latest release](https://github.com/andrewleeog/PowerBalatro/releases/latest), or clone this repository.
+2. Place the repository's contents in a `PowerBalatro` folder inside your Balatro `Mods` directory. `manifest.json`, `BalatroRunStats.lua`, and `lovely/` should be directly inside that folder.
+3. If replacing an older installation, rename or remove its old `BalatroRunStats` folder so only one copy of the mod is installed. Older release ZIPs use that former folder name; rename the extracted folder to `PowerBalatro`.
+4. Restart Balatro.
 
-Open **Run Stats** from the pause menu or the win/game-over screen. After viewing a completed run, Back returns to the result screen.
+Open **PowerBalatro** from the pause menu or the win/game-over screen. After viewing a completed run, Back returns to the result screen.
 
-Run Stats uses flat, dark table rows and disables its own text shadows for readability at small UI scales. These adjustments apply only to its menu.
+PowerBalatro uses flat, dark table rows and disables its own text shadows for readability at small UI scales. These adjustments apply only to its menu.
 
 ## Pages
 
@@ -77,3 +78,7 @@ Game sources and loader dependencies are not included in this repository.
 ## License
 
 [MIT](LICENSE). Redistribution and mod-manager distribution are permitted under this license.
+
+## Naming compatibility
+
+PowerBalatro was previously called Balatro Run Stats. The internal `RunStats` mod ID, save keys, Lua entry filename, and callbacks stay stable for compatibility. Existing GitHub links redirect to the renamed repository. Release downloads retain the `BalatroRunStats.zip` asset name for existing links and automatic updates; future releases may additionally provide a `PowerBalatro.zip` alias.

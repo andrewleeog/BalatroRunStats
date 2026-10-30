@@ -54,14 +54,14 @@ position = "before"
 match_indent = true
 payload = "if not SMODS then require('runstats.runtime') end"
 
-# Add the Run Stats button definition to the pause (options) menu
+# Add the PowerBalatro button definition to the pause (options) menu
 [[patches]]
 [patches.pattern]
 target = "functions/UI_definitions.lua"
 pattern = "local high_scores = UIBox_button{ label = {localize('b_stats')}, button = \"high_scores\", minw = 5}"
 position = "after"
 match_indent = true
-payload = "local run_stats_button = G.STAGE == G.STAGES.RUN and UIBox_button{ label = {\"Run Stats\"}, button = \"runstats_open\", minw = 5} or nil"
+payload = "local run_stats_button = G.STAGE == G.STAGES.RUN and UIBox_button{ label = {\"PowerBalatro\"}, button = \"runstats_open\", minw = 5} or nil"
 
 # Insert it into the options menu contents after the vanilla Stats button
 [[patches]]

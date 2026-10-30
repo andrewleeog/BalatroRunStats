@@ -1,5 +1,5 @@
 -- =============================================================
--- Run Stats — native-style stats menu + per-ante dashboard
+-- PowerBalatro — native-style stats menu + per-ante dashboard
 -- Lovely mod with optional Steamodded integration. Stats persist with the run.
 --
 -- Tabs:
@@ -2878,7 +2878,7 @@ safe_wrap(_G, 'create_UIBox_generic_options', function(ref)
     return function(args, ...)
         if RS._building_result and RS.stats() and args and args.contents then
             args.contents[#args.contents + 1] = UIBox_button{
-                label = { 'Run Stats' }, button = 'runstats_open_' .. RS._building_result,
+                label = { 'PowerBalatro' }, button = 'runstats_open_' .. RS._building_result,
                 minw = 5, minh = 0.5, scale = 0.4, colour = G.C.BLUE,
             }
         end
