@@ -64,6 +64,7 @@ function RS.fresh_stats()
         shops = {},       -- cash on first entry to each shop
         shop_stock = {},  -- offers grouped by visit and reroll; plain save data
         shop_vouchers = {}, -- voucher offers by the ante in which they appeared
+        scoring_hands = {}, -- finalized, per-hand scoring attribution
         draw_tokens = {}, -- latest draw per playing-card ID; survives save/load
         probs = {},        -- [seed] = {rolls, hits, num, den} — every chance roll
         skips = 0,
@@ -185,6 +186,7 @@ function RS.played_antes()
         if furthest <= 0 or ante <= furthest then add(ante) end
     end
     for _, blind in ipairs((s or {}).blinds or {}) do add(blind.ante) end
+    for _, hand in ipairs((s or {}).scoring_hands or {}) do add(hand.ante) end
     for _, group in ipairs((s or {}).shop_stock or {}) do
         if furthest <= 0 or group.ante <= furthest then add(group.ante) end
     end
@@ -414,12 +416,227 @@ local function record_income_detail(bucket, sources, amount, category)
     end
 end
 
+local function finite_score(value)
+    return type(value) == 'number' and value == value and value > -math.huge and value < math.huge
+end
+
+local function scoring_live()
+    local live = RS._scoring_live
+    return live and live.stats == RS.stats() and live.thread == income_thread() and live or nil
+end
+
+local function score_source(card)
+    local live = scoring_live()
+    if not live then return nil end
+    if card and ((card.ability or {}).set == 'Joker' or ((card.config or {}).center or {}).set == 'Joker') then
+        local source = live.owners[card]
+        if not source then
+            local slot
+            for i, owned in ipairs((G.jokers or {}).cards or {}) do if owned == card then slot = i; break end end
+            if not slot then return {id = 'other', name = 'Blind / deck / other', kind = 'other'} end
+            local id = 'joker:' .. tostring(card.sort_id or ('slot:' .. slot))
+            source = {id = id, name = income_source(card).name .. ' [slot ' .. slot .. ']', kind = 'joker', slot = slot}
+            live.owners[card] = source
+            if not live.record.sources[id] then
+                live.record.sources[id] = {name = source.name, kind = 'joker', slot = slot, amount = 0}
+            end
+        end
+        return source
+    end
+    return card and {kind = 'card'} or {id = 'other', name = 'Blind / deck / other', kind = 'other'}
+end
+
+local function score_credit(live, source, amount)
+    if amount == 0 then return end
+    local row = live.record.sources[source.id]
+    if not row then row = {name = source.name, kind = source.kind, slot = source.slot, amount = 0}; live.record.sources[source.id] = row end
+    row.amount = row.amount + amount
+end
+
+local function score_effect_source(live, source, axis)
+    source = source or {id = 'other', name = 'Blind / deck / other', kind = 'other'}
+    if source.kind == 'card' then
+        return live.repetition_owner or (axis == 'chips' and not tostring(live.effect_key):match('^[xX]')
+            and {id = 'card_chips', name = 'Card +Chips', kind = 'cards'}
+            or {id = 'card_effects', name = 'Other card effects', kind = 'cards'})
+    end
+    return source
+end
+
+local function scoring_reconcile(live, source)
+    if not live.ready or not finite_score(hand_chips) or not finite_score(mult) or not finite_score(hand_chips * mult) then return end
+    local axis = hand_chips ~= live.chips and mult == live.mult and 'chips' or 'other'
+    score_credit(live, score_effect_source(live, source, axis), hand_chips * mult - live.chips * live.mult)
+    live.chips, live.mult = hand_chips, mult
+end
+
+function RS.begin_scoring_hand()
+    local stats = RS.stats()
+    if not stats then return end
+    local round, ante = G.GAME.round or 0, (G.GAME.round_resets or {}).ante or 1
+    local round_key = ante .. ':' .. round
+    local index = math.max(1, (G.GAME.current_round or {}).hands_played or 0)
+    for _, hand in ipairs(stats.scoring_hands or {}) do
+        if hand.round_key == round_key then index = math.max(index, hand.hand_index + 1) end
+    end
+    local record = {ante = ante, round = round, round_key = round_key, hand_index = index, hand = 'Hand', sources = {
+        base = {name = 'Base hand / planet levels', kind = 'base', amount = 0},
+        card_chips = {name = 'Card +Chips', kind = 'cards', amount = 0},
+        card_effects = {name = 'Other card effects', kind = 'cards', amount = 0},
+    }}
+    local live = {stats = stats, thread = income_thread(), record = record, owners = {}}
+    RS._scoring_live = live
+    for _, card in ipairs((G.jokers or {}).cards or {}) do score_source(card) end
+end
+
+function RS.scoring_base(hand, chips, hand_mult)
+    -- This hook runs in the actual scoring coroutine, after before-hand effects.
+    local live = RS._scoring_live
+    if not live or live.stats ~= RS.stats() then return end
+    live.thread, live.record.hand = income_thread(), hand
+    live.record.level = ((G.GAME.hands or {})[hand] or {}).level
+    live.chips, live.mult = chips, hand_mult
+    live.source, live.repetition_owner = nil, nil
+    if not finite_score(chips) or not finite_score(hand_mult) or not finite_score(chips * hand_mult) then
+        live.record.unsupported = 'Score outside supported numeric range'; return
+    end
+    local calculation = G.GAME.current_scoring_calculation
+    if calculation and calculation.key and calculation.key ~= 'multiply' then
+        live.record.unsupported = 'Nonstandard scoring formula'; return
+    end
+    live.ready = true
+    live.record.sources.base = {name = 'Base hand / planet levels', kind = 'base', amount = chips * hand_mult}
+    live.record.sources.card_chips = {name = 'Card +Chips', kind = 'cards', amount = 0}
+    live.record.sources.card_effects = {name = 'Other card effects', kind = 'cards', amount = 0}
+end
+
+function RS.scoring_set_effect(effect, card)
+    local live = scoring_live()
+    if not live then return end
+    live.source = effect and effect._runstats_score_source or score_source((effect or {}).card or card)
+end
+
+function RS.scoring_repetition(repetition)
+    local live = scoring_live()
+    if not live then return end
+    local effect = type(repetition) == 'table' and (repetition.jokers or repetition.seals)
+    local source = effect and (effect._runstats_score_source or score_source(effect.card))
+    live.repetition_owner = source and source.kind == 'joker' and source or nil
+end
+
+function RS.with_scoring_effect(effect, card, key, fn, ...)
+    local live = scoring_live()
+    if not live then return fn(...) end
+    scoring_reconcile(live, nil)
+    local previous, old_key = live.source, live.effect_key
+    live.source = (effect or {})._runstats_score_source or score_source((effect or {}).card or (effect or {}).juice_card or card)
+    if live.source and live.source.kind == 'card' and live.pass_card and live.pass_card.repetition_trigger then
+        live.source = live.pass_retrigger or live.source
+    end
+    live.effect_key = key
+    local result = pack_results(fn(...))
+    if scoring_live() == live then scoring_reconcile(live, live.source) end
+    live.source, live.effect_key = previous, old_key
+    return unpack(result, 1, result.n)
+end
+
+for _, item in ipairs({{'mod_chips', 'chips'}, {'mod_mult', 'mult'}}) do
+    local method, axis = item[1], item[2]
+    safe_wrap(_G, method, function(ref)
+        return function(...)
+            local result = pack_results(ref(...))
+            local live, value = scoring_live(), result[1]
+            if live and live.ready then
+                if finite_score(value) then
+                    local before = live.chips * live.mult
+                    local chips, hand_mult = axis == 'chips' and value or live.chips, axis == 'mult' and value or live.mult
+                    local after = chips * hand_mult
+                    if finite_score(after) then
+                        local source = score_effect_source(live, live.source, axis)
+                        score_credit(live, source, after - before)
+                        live.chips, live.mult = chips, hand_mult
+                    else live.record.unsupported = 'Score outside supported numeric range'; live.ready = false end
+                else live.record.unsupported = 'Score outside supported numeric range'; live.ready = false end
+            end
+            return unpack(result, 1, result.n)
+        end
+    end)
+end
+
+function RS.finish_scoring_hand(score)
+    local live = scoring_live()
+    if not live then return end
+    local record = live.record
+    if finite_score(score) then
+        record.total = math.floor(score)
+        local known = 0
+        for _, row in pairs(record.sources) do known = known + row.amount end
+        if not record.unsupported then
+            score_credit(live, {id = 'other', name = 'Blind / deck / rounding', kind = 'other'}, record.total - known)
+        end
+    else record.unsupported = 'Score outside supported numeric range'; record.total_text = tostring(score) end
+    live.stats.scoring_hands = live.stats.scoring_hands or {}
+    record.id = #live.stats.scoring_hands + 1
+    live.stats.scoring_hands[#live.stats.scoring_hands + 1] = record
+    RS._scoring_live, RS._scoring_page = nil, 1
+end
+
+safe_wrap(Card, 'calculate_joker', function(ref)
+    return function(self, context, ...)
+        local live = scoring_live()
+        if not live then return ref(self, context, ...) end
+        local source, previous = score_source(self), live.source
+        live.source = context and context.blueprint and previous or source
+        local result = pack_results(ref(self, context, ...))
+        if scoring_live() == live then scoring_reconcile(live, live.source) end
+        live.source = previous
+        if type(result[1]) == 'table' then result[1]._runstats_score_source = source end
+        if not SMODS and context and context.other_joker and result[1] then live.source = source end
+        return unpack(result, 1, result.n)
+    end
+end)
+safe_wrap(_G, 'eval_card', function(ref)
+    return function(card, context, ...)
+        local result = pack_results(ref(card, context, ...))
+        local live = scoring_live()
+        if live and not SMODS and context and not context.repetition and not context.repetition_only and type(result[1]) == 'table' then
+            local source = score_source(card)
+            result[1]._runstats_score_source = source
+            if type(result[1].jokers) == 'table' then result[1].jokers._runstats_score_source = source end
+            if context.cardarea == G.jokers then live.source = source end
+        end
+        return unpack(result, 1, result.n)
+    end
+end)
+safe_wrap(SMODS, 'score_card', function(ref)
+    return function(card, context, ...)
+        local live = scoring_live()
+        if not live then return ref(card, context, ...) end
+        local previous, owner = live.pass_card, live.pass_retrigger
+        live.pass_card, live.pass_retrigger = card, nil
+        local result = pack_results(ref(card, context, ...))
+        live.pass_card, live.pass_retrigger = previous, owner
+        return unpack(result, 1, result.n)
+    end
+end)
+safe_wrap(SMODS, 'calculate_effect', function(ref)
+    return function(effect, card, ...)
+        local live = scoring_live()
+        if live and live.pass_card and effect and effect.repetitions then
+            local source = effect._runstats_score_source or score_source(effect.card)
+            live.pass_retrigger = source and source.kind == 'joker' and source or nil
+        end
+        return ref(effect, card, ...)
+    end
+end)
+
 safe_wrap(SMODS, 'calculate_individual_effect', function(ref)
     return function(effect, scored_card, key, amount, ...)
         if key == 'dollars' or key == 'p_dollars' or key == 'h_dollars' then
-            return RS.with_payment_income(effect, scored_card, key, ref, effect, scored_card, key, amount, ...)
+            return RS.with_scoring_effect(effect, scored_card, key, RS.with_payment_income,
+                effect, scored_card, key, ref, effect, scored_card, key, amount, ...)
         end
-        return ref(effect, scored_card, key, amount, ...)
+        return RS.with_scoring_effect(effect, scored_card, key, ref, effect, scored_card, key, amount, ...)
     end
 end)
 
@@ -681,6 +898,8 @@ end)
 
 safe_wrap(_G, 'set_hand_usage', function(ref)
     return function(hand, ...)
+        local live = scoring_live()
+        if live then live.record.hand = hand end
         local pa = RS.pa()
         if pa then
             pa.hand_types = pa.hand_types or {}
@@ -905,6 +1124,7 @@ end)
 safe_wrap(_G, 'check_and_set_high_score', function(ref)
     return function(stat, score, ...)
         local s = RS.stats()
+        if stat == 'hand' then RS.finish_scoring_hand(score) end
         if s and type(score) == 'number' then
             if stat == 'hand' then
                 local record = RS.blind_record(true)
@@ -1161,6 +1381,7 @@ if G.FUNCS.evaluate_play then
             if s and G.play and G.play.cards then
                 for _, c in ipairs(G.play.cards) do played[#played + 1] = c end
             end
+            if s then RS.begin_scoring_hand() end
             local r = ref(e, ...)
             if s and #played > 0 then
                 print('RunStats: evaluate_play recorded ' .. #played .. ' cards')
@@ -1416,7 +1637,10 @@ function RSChart:draw()
     end
     if horizontal then
         local slot = ph / #labels
-        local maxv = math.max(1, hi)
+        local minv, maxv = math.min(0, lo), math.max(1, hi)
+        local bar_space = pw - (data.value_space or 0.3)
+        local function xpos(value) return left + (value - minv) / (maxv - minv) * bar_space end
+        local zero = xpos(0)
         for i, label in ipairs(labels) do
             local value = series[1].values[i] or 0
             local cy = top + (i - 1) * slot
@@ -1427,9 +1651,10 @@ function RSChart:draw()
             end
             self:_text(tostring(label), 0.06, cy, label_scale, {1, 1, 1, 0.85})
             graphics.setColor((data.colours or {})[i] or series[1].colour)
-            local width = value / maxv * (pw - 0.3)
-            if value > 0 then graphics.rectangle('fill', left, cy + slot * 0.15, width, slot * 0.65) end
-            self:_text(tostring(value), left + width + 0.06, cy, math.min(0.19, slot * 1.05), {1, 1, 1, 0.85})
+            local edge = xpos(value)
+            if value ~= 0 then graphics.rectangle('fill', math.min(zero, edge), cy + slot * 0.15, math.abs(edge - zero), slot * 0.65) end
+            self:_text((data.value_labels or {})[i] or tostring(value), math.max(zero, edge) + 0.06, cy,
+                data.value_labels and math.min(0.16, slot * 1.05) or math.min(0.19, slot * 1.05), {1, 1, 1, 0.85})
         end
     else
         for _, value in ipairs(ticks) do
@@ -2004,6 +2229,140 @@ local function chart_node(title, data_fn, opts)
             }) } },
         } },
     } }
+end
+
+RS._scoring_page, RS._scoring_round, RS._scoring_source_pages = 1, nil, {}
+
+function RS.scoring_rounds()
+    local options, seen = {}, {}
+    for _, hand in ipairs((RS.stats() or {}).scoring_hands or {}) do
+        if RS.in_slice(hand.ante) and not seen[hand.round_key] then
+            seen[hand.round_key] = true
+            options[#options + 1] = {key = hand.round_key, label = 'Round ' .. hand.round .. ' (Ante ' .. hand.ante .. ')'}
+        end
+    end
+    return options
+end
+
+function RS.scoring_history()
+    if RS._scoring_ante_seen ~= RS._ante_sel then RS._scoring_page, RS._scoring_ante_seen = 1, RS._ante_sel end
+    local valid = RS._scoring_round == nil
+    for _, option in ipairs(RS.scoring_rounds()) do if option.key == RS._scoring_round then valid = true end end
+    if not valid then RS._scoring_round = nil; RS._scoring_page = 1 end
+    local rows, history = {}, (RS.stats() or {}).scoring_hands or {}
+    for i = #history, 1, -1 do
+        local hand = history[i]
+        if RS.in_slice(hand.ante) and (not RS._scoring_round or hand.round_key == RS._scoring_round) then rows[#rows + 1] = hand end
+    end
+    return rows
+end
+
+function RS.scoring_chart_data(hand)
+    if hand.unsupported then return {antes = {}, series = {}, empty = hand.unsupported, pages = 1} end
+    local rows = {}
+    for id, source in pairs(hand.sources) do
+        rows[#rows + 1] = {id = id, name = source.name, kind = source.kind, slot = source.slot, amount = source.amount,
+            percent = hand.total and hand.total ~= 0 and 100 * source.amount / hand.total or nil}
+    end
+    table.sort(rows, function(a, b)
+        if a.amount ~= b.amount then return a.amount > b.amount end
+        if (a.slot or 0) ~= (b.slot or 0) then return (a.slot or 0) < (b.slot or 0) end
+        return a.id < b.id
+    end)
+    local pages = math.max(1, math.ceil(#rows / 8))
+    local page = math.max(1, math.min(RS._scoring_source_pages[hand.id] or 1, pages))
+    RS._scoring_source_pages[hand.id] = page
+    local labels, values, colours, value_labels = {}, {}, {}, {}
+    for i = (page - 1) * 8 + 1, math.min(page * 8, #rows) do
+        local row = rows[i]
+        labels[#labels + 1], values[#values + 1] = row.name, row.percent or 0
+        value_labels[#value_labels + 1] = number_format(row.amount) .. (row.percent and string.format(' (%.1f%%)', row.percent) or ' (--)')
+        local colour = row.kind == 'base' and {0.3, 0.66, 1, 1}
+            or row.id == 'card_chips' and {0.24, 0.8, 0.42, 1}
+            or row.kind == 'cards' and {0.7, 0.45, 0.95, 1} or {0.65, 0.71, 0.76, 1}
+        if row.kind == 'joker' then
+            local angle = (row.slot or i) * 2.4
+            colour = {0.65 + 0.25 * math.cos(angle), 0.65 + 0.25 * math.cos(angle + 2.1), 0.65 + 0.25 * math.cos(angle + 4.2), 1}
+        end
+        colours[#colours + 1] = colour
+    end
+    return {antes = labels, series = {series_of('Share of hand score (%)', G.C.BLUE, values)}, colours = colours,
+        value_labels = value_labels, value_space = 1.65, label_width = 2.8, pages = pages, rows = rows}
+end
+
+for _, direction in ipairs({'previous', 'next'}) do
+    G.FUNCS['runstats_scoring_round_' .. direction] = function()
+        local options, index = RS.scoring_rounds(), 0
+        for i, option in ipairs(options) do if option.key == RS._scoring_round then index = i; break end end
+        index = math.max(0, math.min(#options, index + (direction == 'next' and 1 or -1)))
+        RS._scoring_round, RS._scoring_page = options[index] and options[index].key or nil, 1
+        RS.show_menu()
+    end
+    G.FUNCS['runstats_scoring_hands_' .. direction] = function()
+        local pages = math.max(1, math.ceil(#RS.scoring_history() / 2))
+        RS._scoring_page = math.max(1, math.min(pages, RS._scoring_page + (direction == 'next' and 1 or -1)))
+        RS.show_menu()
+    end
+    G.FUNCS['runstats_scoring_sources_' .. direction] = function(e)
+        local id = e and e.config and e.config.ref_table
+        local hand = ((RS.stats() or {}).scoring_hands or {})[id or 0]
+        if not hand then return end
+        local data = RS.scoring_chart_data(hand)
+        RS._scoring_source_pages[id] = math.max(1, math.min(data.pages, (RS._scoring_source_pages[id] or 1) + (direction == 'next' and 1 or -1)))
+        RS.show_menu()
+    end
+end
+G.FUNCS.runstats_scoring_round_reset = function() RS._scoring_round, RS._scoring_page = nil, 1; RS.show_menu() end
+
+local function scoring_tab()
+    local history, controls, selected = RS.scoring_history(), {}, 0
+    local rounds = RS.scoring_rounds()
+    for i, option in ipairs(rounds) do if option.key == RS._scoring_round then selected = i; break end end
+    local pages = math.max(1, math.ceil(#history / 2))
+    RS._scoring_page = math.max(1, math.min(RS._scoring_page, pages))
+    local function button(label, callback, enabled, width, id)
+        return UIBox_button{label = {label}, button = enabled and callback or 'nil', minw = width or 0.6,
+            minh = 0.4, scale = 0.27, col = true, ref_table = id,
+            colour = enabled and G.C.BLUE or G.C.UI.BACKGROUND_INACTIVE}
+    end
+    controls = {
+        {n = G.UIT.T, config = {text = 'Round:', scale = 0.28, colour = G.C.UI.TEXT_LIGHT}},
+        button('<', 'runstats_scoring_round_previous', selected > 0),
+        button(rounds[selected] and rounds[selected].label or 'All rounds', 'runstats_scoring_round_reset', true, 3.8),
+        button('>', 'runstats_scoring_round_next', selected < #rounds),
+        button('Newer hands', 'runstats_scoring_hands_previous', RS._scoring_page > 1, 2),
+        button('Older hands', 'runstats_scoring_hands_next', RS._scoring_page < pages, 2),
+        {n = G.UIT.T, config = {text = RS._scoring_page .. ' / ' .. pages, scale = 0.23, colour = G.C.UI.TEXT_LIGHT}},
+    }
+    local contents = {{n = G.UIT.R, config = {align = 'cm', padding = 0.04}, nodes = controls}}
+    local panels = {}
+    for i = (RS._scoring_page - 1) * 2 + 1, math.min(#history, RS._scoring_page * 2) do
+        local hand = history[i]
+        local name = localize(hand.hand, 'poker_hands')
+        local title = 'A' .. hand.ante .. ' R' .. hand.round .. ' H' .. hand.hand_index .. ': ' .. name
+            .. ' - ' .. (hand.total and number_format(hand.total) or 'unsupported')
+        local panel = chart_node(title, function() return RS.scoring_chart_data(hand) end, {w = 6.4, h = 3.8, kind = 'horizontal'})
+        local data, source_controls = RS.scoring_chart_data(hand), {}
+        if data.pages > 1 then
+            local page = RS._scoring_source_pages[hand.id] or 1
+            source_controls = {button('<', 'runstats_scoring_sources_previous', page > 1, 0.6, hand.id),
+                {n = G.UIT.T, config = {text = 'Sources ' .. page .. ' / ' .. data.pages, scale = 0.22, colour = G.C.UI.TEXT_LIGHT}},
+                button('>', 'runstats_scoring_sources_next', page < data.pages, 0.6, hand.id)}
+        end
+        panel.nodes[#panel.nodes + 1] = {n = G.UIT.R, config = {align = 'cm', minh = 0.4}, nodes = source_controls}
+        panels[#panels + 1] = panel
+    end
+    if #panels > 0 then contents[#contents + 1] = {n = G.UIT.R, config = {align = 'cm'}, nodes = panels}
+    else contents[#contents + 1] = {n = G.UIT.R, config = {align = 'cm', minh = 3}, nodes = {
+        {n = G.UIT.T, config = {text = 'Play a hand to begin scoring history. Earlier hands cannot be reconstructed.', scale = 0.26, colour = G.C.UI.TEXT_LIGHT}},
+    }} end
+    contents[#contents + 1] = {n = G.UIT.R, config = {align = 'cm', padding = 0.025}, nodes = {
+        {n = G.UIT.T, config = {text = 'Shares follow scoring order: a multiplier gets the extra score it creates. Negative shares show penalties.', scale = 0.21, colour = G.C.UI.TEXT_LIGHT}},
+    }}
+    contents[#contents + 1] = {n = G.UIT.R, config = {align = 'cm', padding = 0.025}, nodes = {
+        {n = G.UIT.T, config = {text = 'Tracks direct effects and card retriggers. Setup or enabling Jokers can have zero direct share. Values: score (percent).', scale = 0.20, colour = G.C.UI.TEXT_LIGHT}},
+    }}
+    return contents
 end
 
 local function kpi_row()
@@ -3342,6 +3701,7 @@ local function tabs_row()
     return { n = G.UIT.R, config = { align = 'cm', padding = 0.05 }, nodes = {
         tab_button('Summary', 'runstats_tab_stats', 'stats'),
         tab_button('Trends', 'runstats_tab_dash', 'dashboard'),
+        tab_button('Scoring', 'runstats_tab_scoring', 'scoring'),
         tab_button('Probabilities', 'runstats_tab_prob', 'probabilities'),
         tab_button('Deck', 'runstats_tab_cards', 'cards'),
         tab_button('Consumables', 'runstats_tab_consumables', 'consumables'),
@@ -3471,6 +3831,8 @@ function create_UIBox_runstats()
         for _, row in ipairs(shop_tab()) do contents[#contents + 1] = row end
     elseif RS._tab == 'consumables' then
         for _, row in ipairs(consumables_tab()) do contents[#contents + 1] = row end
+    elseif RS._tab == 'scoring' then
+        for _, row in ipairs(scoring_tab()) do contents[#contents + 1] = row end
     else
         local cols = stats_tab_columns()
         contents[#contents + 1] = { n = G.UIT.R, config = { align = 'ct' }, nodes = cols }
@@ -3523,5 +3885,7 @@ G.FUNCS.runstats_tab_consumables = function()
     RS._tab = 'consumables'
     RS.show_menu()
 end
+
+G.FUNCS.runstats_tab_scoring = function() RS._tab, RS._scoring_page = 'scoring', 1; RS.show_menu() end
 
 return RS

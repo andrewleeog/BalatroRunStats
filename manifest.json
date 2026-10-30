@@ -4,8 +4,8 @@
   "author": [
     "andrewleeog"
   ],
-  "description": "Tracks run statistics, income and spending sources, poker-hand levels, deck composition, booster packs, card use rates and triggers, consumable usage by card and type, shop stock and offer frequency, probability hit rates and blind history. Requires Lovely; Steamodded is optional.",
+  "description": "Tracks run statistics, per-hand Joker scoring contributions, income and spending sources, poker-hand levels, deck composition, card use rates and triggers, consumables, shop history, edition rates, reroll efficiency and probabilities. Requires Lovely; Steamodded is optional.",
   "prefix": "rs",
-  "version": "1.5.3",
+  "version": "1.6.0",
   "main_file": "BalatroRunStats.lua"
 }

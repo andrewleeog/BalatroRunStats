@@ -23,7 +23,15 @@ function Card:use_consumeable(area, copier)
     self.test_uses = (self.test_uses or 0) + 1
     return 'used', nil, copier
 end
-function eval_card(card)
+function Card:calculate_joker() return self.test_effect end
+function mod_chips(value) return value end
+function mod_mult(value) return value end
+function eval_card(card, context)
+    if card.test_score_chips then
+        local effect = {chips = card.test_score_chips}
+        return SMODS and {playing_card = effect, active = true} or effect
+    end
+    if (card.ability or {}).set == 'Joker' then return {jokers = Card.calculate_joker(card, context)} end
     if card.test_income then
         local effect = {p_dollars = Card.get_p_dollars(card)}
         return SMODS and {playing_card = effect} or effect
@@ -63,12 +71,24 @@ if SMODS then
     SMODS.calculate_card_areas = noop
     SMODS.calculate_effect = noop
     SMODS.calculate_repetitions = function(card, context, reps)
-        for _ = 2, card.test_repetitions or 1 do reps[#reps + 1] = {seals = {card = card}} end
+        for _ = 2, card.test_repetitions or 1 do
+            reps[#reps + 1] = card.test_retrigger_joker and {jokers = {card = card.test_retrigger_joker, repetitions = 1}} or {seals = {card = card}}
+        end
     end
-    SMODS.trigger_effects = function(effects) return {calculated = effects.active or (effects[1] or {}).active}, nil, 'preserved' end
+    SMODS.trigger_effects = function(effects, card)
+        for _, effect in ipairs(effects) do
+            if effect.playing_card and effect.playing_card.chips then
+                SMODS.calculate_individual_effect(effect.playing_card, card, 'chips', effect.playing_card.chips)
+            end
+        end
+        return {calculated = effects.active or (effects[1] or {}).active}, nil, 'preserved'
+    end
     percent, percent_delta = 0, 0.1
     SMODS.calculate_individual_effect = function(effect, scored_card, key, amount)
         if key == 'dollars' or key == 'p_dollars' or key == 'h_dollars' then ease_dollars(amount); return true end
+        if key == 'chips' or key == 'chip_mod' then hand_chips = mod_chips(hand_chips + amount); return true end
+        if key == 'mult' or key == 'mult_mod' then mult = mod_mult(mult + amount); return true end
+        if key == 'x_mult' then mult = mod_mult(mult * amount); return true end
         return false
     end
 end
@@ -111,7 +131,7 @@ G = {
             local card = e.config.ref_table
             if card.ability.set == 'Booster' then card:open() end
         end,
-        evaluate_play = function() end,
+        evaluate_play = function() if G.test_scoring_play then return G.test_scoring_play() end end,
         evaluate_round = function()
             for _, config in ipairs(G.test_round_rows or {}) do add_round_eval_row(config) end
         end,
@@ -1438,6 +1458,167 @@ assert(menu_text['Reroll efficiency: Free refreshes only ($0 spent)'])
 s.shop_stock = nil
 assert(RS.reroll_efficiency().shops_seen == 0)
 s.shop_stock = saved_stock
+-- Score attribution telescopes actual score changes, without replaying effects.
+s = fresh()
+G.play = area()
+local function owned_joker(name, id)
+    return {sort_id = id, ability = {set = 'Joker', name = name}, config = {center_key = 'j_' .. id}}
+end
+local chip_joker, plus_joker, times_joker = owned_joker('Chip Joker', 101), owned_joker('Plus Joker', 102), owned_joker('Times Joker', 103)
+local quiet_joker, duplicate_joker = owned_joker('Quiet Joker', 104), owned_joker('Chip Joker', 105)
+G.jokers = {cards = {chip_joker, plus_joker, times_joker, quiet_joker, duplicate_joker}}
+G.GAME.hands = {Pair = {level = 3, chips = 10, mult = 2}}
+local playing = {base = {suit = 'Hearts', id = 10}, ability = {set = 'Default'}, test_score_chips = 10}
+local function scoring_start()
+    RS.begin_scoring_hand()
+    set_hand_usage('Pair')
+    hand_chips, mult = 10, 2
+    RS.scoring_base('Pair', hand_chips, mult)
+end
+local function score_effect(effect, card, key, amount)
+    if SMODS then return SMODS.calculate_individual_effect(effect, card, key, amount) end
+    RS.scoring_set_effect(effect, card)
+    if key == 'chips' or key == 'chip_mod' then hand_chips = mod_chips(hand_chips + amount)
+    elseif key == 'mult' or key == 'mult_mod' then mult = mod_mult(mult + amount)
+    elseif key == 'x_mult' then mult = mod_mult(mult * amount) end
+end
+local rolls_before = random_calls
+scoring_start()
+local normal_effect = eval_card(playing, {cardarea = G.play, main_scoring = true})
+normal_effect = normal_effect.playing_card or normal_effect
+score_effect(normal_effect, playing, 'chips', 10)
+score_effect({card = chip_joker}, playing, 'chips', 5)
+score_effect({card = plus_joker}, playing, 'mult', 3)
+score_effect({card = times_joker}, playing, 'x_mult', 2)
+check_and_set_high_score('hand', hand_chips * mult)
+assert(#s.scoring_hands == 1 and s.scoring_hands[1].total == 250 and not RS._scoring_live)
+local hand = s.scoring_hands[1]
+assert(hand.sources.base.amount == 20 and hand.sources.card_chips.amount == 20)
+assert(hand.sources['joker:101'].amount == 10 and hand.sources['joker:102'].amount == 75 and hand.sources['joker:103'].amount == 125)
+assert(hand.sources['joker:104'].amount == 0 and hand.sources['joker:105'].amount == 0)
+assert(hand.sources['joker:101'].name ~= hand.sources['joker:105'].name, 'owned duplicate Jokers have separate slot labels')
+local sum, percent_sum = 0, 0
+for _, row in ipairs(RS.scoring_chart_data(hand).rows) do sum = sum + row.amount; percent_sum = percent_sum + row.percent end
+assert(sum == 250 and math.abs(percent_sum - 100) < 0.000001)
+assert(random_calls == rolls_before, 'tracking must not replay scoring or draw random numbers')
+local count = #s.scoring_hands
+check_and_set_high_score('hand', 999)
+assert(#s.scoring_hands == count, 'high-score updates alone cannot invent scoring history')
+-- Other card effects and penalties remain signed and reconcile to the total.
+scoring_start()
+score_effect(normal_effect, playing, 'chips', 10)
+score_effect({}, playing, 'x_mult', 2)
+score_effect({card = plus_joker}, playing, 'mult', -1)
+check_and_set_high_score('hand', hand_chips * mult)
+hand = s.scoring_hands[2]
+assert(hand.total == 60 and hand.sources.card_effects.amount == 40 and hand.sources['joker:102'].amount == -20)
+RSChart({w = 6.4, h = 3.8, kind = 'horizontal', data = function() return RS.scoring_chart_data(hand) end}):draw()
+-- Retriggered intrinsic card scoring belongs to the Joker that requested it.
+local seltzer = owned_joker('Seltzer', 106)
+G.jokers.cards[#G.jokers.cards + 1] = seltzer
+scoring_start()
+if SMODS then
+    playing.test_repetitions, playing.test_retrigger_joker = 2, seltzer
+    SMODS.score_card(playing, {cardarea = G.play})
+    playing.test_repetitions, playing.test_retrigger_joker = nil, nil
+else
+    RS.scoring_repetition(1)
+    score_effect(normal_effect, playing, 'chips', 10)
+    RS.scoring_repetition({jokers = {card = seltzer, repetitions = 1}})
+    score_effect(normal_effect, playing, 'chips', 10)
+end
+check_and_set_high_score('hand', hand_chips * mult)
+hand = s.scoring_hands[3]
+assert(hand.total == 60 and hand.sources.card_chips.amount == 20 and hand.sources['joker:106'].amount == 20)
+-- Raw values use awarded score; fractional rounding is a separate adjustment.
+scoring_start()
+score_effect({card = chip_joker}, playing, 'chips', 15)
+score_effect({card = times_joker}, playing, 'x_mult', 1.25)
+RS.scoring_set_effect(nil); RS.scoring_repetition(nil)
+check_and_set_high_score('hand', hand_chips * mult)
+hand = s.scoring_hands[4]
+assert(hand.total == 62 and hand.sources.other.amount == -0.5)
+sum = 0; for _, source in pairs(hand.sources) do sum = sum + source.amount end
+assert(sum == hand.total)
+-- Unsupported number systems/formulas are explicit, never guessed shares.
+RS.begin_scoring_hand(); RS.scoring_base('Pair', math.huge, 2); RS.finish_scoring_hand(math.huge)
+assert(RS.scoring_chart_data(s.scoring_hands[5]).empty == 'Score outside supported numeric range')
+G.GAME.current_scoring_calculation = {key = 'add'}
+scoring_start(); RS.finish_scoring_hand(12)
+assert(RS.scoring_chart_data(s.scoring_hands[6]).empty == 'Nonstandard scoring formula')
+G.GAME.current_scoring_calculation = nil
+RS.begin_scoring_hand(); check_and_set_high_score('hand', 0)
+assert(s.scoring_hands[7].total == 0 and s.scoring_hands[7].sources.base.amount == 0)
+-- Vanilla Joker edition/main effects run outside the individual-card loops.
+if not SMODS then
+    scoring_start()
+    chip_joker.test_effect = {chip_mod = 5, card = chip_joker}
+    local effect = eval_card(chip_joker, {cardarea = G.jokers, joker_main = true})
+    hand_chips = mod_chips(hand_chips + effect.jokers.chip_mod)
+    check_and_set_high_score('hand', hand_chips * mult)
+    assert(s.scoring_hands[#s.scoring_hands].sources['joker:101'].amount == 10)
+end
+G.GAME.round_resets.ante, G.GAME.round = 2, 2
+scoring_start(); check_and_set_high_score('hand', 20)
+G.GAME.run_stats = copy(s); s = G.GAME.run_stats
+assert(s.scoring_hands[1].sources['joker:103'].amount == 125, 'per-hand attribution persists with saves')
+RS._ante_sel, RS._scoring_round = 0, nil
+assert(#RS.scoring_rounds() == 2 and #RS.scoring_history() == #s.scoring_hands)
+G.FUNCS.runstats_tab_scoring()
+assert(RS._tab == 'scoring')
+charts = {}; walk(G.last_overlay)
+assert(#charts == 2, 'one graph per hand, two hands per page')
+for _, chart in ipairs(charts) do chart:draw() end
+G.FUNCS.runstats_scoring_hands_next(); assert(RS._scoring_page == 2)
+G.FUNCS.runstats_scoring_round_next(); assert(RS._scoring_round == '1:1')
+for _, record in ipairs(RS.scoring_history()) do assert(record.round_key == '1:1') end
+RS._ante_sel = 2
+RS.show_menu()
+assert(RS._scoring_round == nil and #RS.scoring_history() == 1 and RS._scoring_page == 1)
+local last_hand = s.scoring_hands[#s.scoring_hands]
+for i = 1, 10 do last_hand.sources['extra:' .. i] = {name = 'Owned Joker ' .. i, kind = 'joker', slot = 6 + i, amount = 0} end
+local source_data = RS.scoring_chart_data(last_hand)
+assert(source_data.pages >= 2)
+G.FUNCS.runstats_scoring_sources_next({config = {ref_table = last_hand.id}})
+assert(RS._scoring_source_pages[last_hand.id] == 2)
+G.FUNCS.runstats_scoring_sources_previous({config = {ref_table = last_hand.id}})
+assert(RS._scoring_source_pages[last_hand.id] == 1)
+-- The actual evaluate_play hook opens the trace; final scoring closes it once.
+local old_count = #s.scoring_hands
+G.test_scoring_play = function()
+    hand_chips, mult = 10, 2
+    RS.scoring_base('Pair', hand_chips, mult)
+    score_effect({card = chip_joker}, playing, 'chips', 5)
+    check_and_set_high_score('hand', hand_chips * mult)
+    return 'played'
+end
+G.play.cards = {playing}
+assert(G.FUNCS.evaluate_play() == 'played')
+G.test_scoring_play = nil
+assert(#s.scoring_hands == old_count + 1 and s.scoring_hands[#s.scoring_hands].total == 30)
+-- Direct assignments in an effect are reconciled, with return values intact.
+scoring_start()
+local first, gap, last = RS.with_scoring_effect({card = chip_joker}, playing, 'chips', function()
+    hand_chips = hand_chips + 5
+    return 'ok', nil, 7
+end)
+assert(first == 'ok' and gap == nil and last == 7)
+RS.finish_scoring_hand(hand_chips * mult)
+assert(s.scoring_hands[#s.scoring_hands].sources['joker:101'].amount == 10)
+local runner = coroutine.create(function()
+    scoring_start(); coroutine.yield()
+    score_effect({card = chip_joker}, playing, 'chips', 5)
+    RS.finish_scoring_hand(hand_chips * mult)
+end)
+assert(coroutine.resume(runner))
+mod_chips(999) -- an unrelated thread must not receive scoring credit
+assert(coroutine.resume(runner))
+assert(s.scoring_hands[#s.scoring_hands].total == 30 and s.scoring_hands[#s.scoring_hands].sources['joker:101'].amount == 10)
+s.scoring_hands = nil
+assert(#RS.scoring_history() == 0, 'older hands without recorded effects cannot be reconstructed')
+RS._ante_sel = 0
+G.FUNCS.runstats_tab_scoring()
+print('Scoring checks passed: additive/multiplicative attribution, owned duplicates/zero shares, card chips, retrigger causes, penalties/rounding, exact totals, zero/unsupported scores, RNG preservation, filters, graph paging and saves')
 print('Reroll efficiency passed: paired charges, free/discounted refreshes, opening-stock exclusion, no duplicates, source antes, unknown costs and saves')
 print('Shop edition rates passed: separate Joker/playing samples, edition breakdowns, voucher gating, ante filters, full history, unknown data, modded editions and saves')
 print('Consumables checks passed: four charts, renamed tabs, individual/type totals, hook returns, ante filters, colors, independent paging, saves and older history')

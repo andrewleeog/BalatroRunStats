@@ -11,6 +11,60 @@ source = "BalatroRunStats.lua"
 before = "main.lua"
 name = "runstats.runtime"
 
+# Start the attribution baseline after before-hand effects have set hand levels.
+[[patches]]
+[patches.pattern]
+target = "functions/state_events.lua"
+pattern = "local modded = false"
+position = "before"
+match_indent = true
+payload = "if RunStats then RunStats.scoring_base(text, hand_chips, mult) end"
+
+# Blind/deck changes get their own residual rather than the last Joker's credit.
+[[patches]]
+[patches.pattern]
+target = "functions/state_events.lua"
+pattern = "local nu_chip, nu_mult = G.GAME.selected_back:trigger_effect{context = 'final_scoring_step', chips = hand_chips, mult = mult}"
+position = "before"
+match_indent = true
+payload = "if RunStats then RunStats.scoring_set_effect(nil); RunStats.scoring_repetition(nil) end"
+
+# Vanilla effect loops; Steamodded uses the calculate_individual_effect hook.
+[[patches]]
+[patches.regex]
+target = "functions/state_events.lua"
+pattern = '(?m)^(?<indent>[\t ]*)for ii = 1, #effects do[\t ]*$'
+position = "at"
+line_prepend = '$indent'
+payload = """
+for ii = 1, #effects do
+    if RunStats and not SMODS then RunStats.scoring_set_effect(effects[ii]) end
+"""
+
+# Remember the Joker that caused each vanilla playing-card repetition.
+[[patches]]
+[patches.regex]
+target = "functions/state_events.lua"
+pattern = '(?m)^(?<indent>[\t ]*)(?<statement>if reps\[j\] ~= 1 then[^\r\n]*)$'
+position = "at"
+line_prepend = '$indent'
+payload = """
+if RunStats and not SMODS then RunStats.scoring_repetition(reps[j]) end
+$statement
+"""
+
+# A Joker's Polychrome edition applies after other-Joker effects in vanilla.
+[[patches]]
+[patches.regex]
+target = "functions/state_events.lua"
+pattern = '(?m)^(?<indent>[\t ]*)(?<statement>if edition_effects\.jokers\.[a-z_]+ then)[\t ]*$'
+position = "at"
+line_prepend = '$indent'
+payload = """
+if RunStats and not SMODS then RunStats.scoring_set_effect(edition_effects.jokers, _card) end
+$statement
+"""
+
 # Begin before stock is generated/restored; capture again after tags modify it.
 [[patches]]
 [patches.pattern]

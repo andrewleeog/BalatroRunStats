@@ -105,7 +105,7 @@ assert(total == 19 and income.blinds == 5 and income.hands == 2 and income.inter
 print('Income patch checks passed: actual cash-out preparation and sale-credit payloads')
 """
 card_payment = next(p['payload'] for p in regex_patches if p['target'] == 'card.lua')
-effect_payment = next(p['payload'] for p in regex_patches if p['target'] == 'functions/state_events.lua')
+effect_payment = next(p['payload'] for p in regex_patches if 'with_payment_income' in p['payload'])
 script += """
 G.GAME.run_stats = RS.fresh_stats()
 G.GAME.round_resets.ante = 1
@@ -144,6 +144,51 @@ else
     assert(bucket.scoring_triggers['Hearts:14'] == 1 and bucket.held_triggers['Hearts:14'] == 1)
 end
 print('Trigger patch checks passed: exact scoring/held payloads and no double counting with Steamodded')
+"""
+base_payload = next(p['payload'] for p in patches if 'RunStats.scoring_base' in p['payload'])
+loop_payload = next(p['payload'] for p in regex_patches if 'scoring_set_effect(effects[ii])' in p['payload'])
+repeat_payload = next(p['payload'] for p in regex_patches if 'RunStats.scoring_repetition(reps[j])' in p['payload'])
+edition_payload = next(p['payload'] for p in regex_patches if 'scoring_set_effect(edition_effects.jokers' in p['payload'])
+script += """
+do
+G.GAME.run_stats = RS.fresh_stats()
+G.GAME.round_resets.ante = 1
+G.GAME.round = 1
+local joker = {sort_id = 999, ability = {set = 'Joker', name = 'Test Joker'}}
+G.jokers = {cards = {joker}}
+local card = {test_score_chips = 5, base = {suit = 'Hearts', id = 5}, ability = {set = 'Default'}}
+local text = 'Pair'
+hand_chips, mult = 10, 2
+RS.begin_scoring_hand()
+""" + base_payload + """
+local effect = eval_card(card, {cardarea = G.play, main_scoring = true})
+effect = effect.playing_card or effect
+if SMODS then
+    SMODS.calculate_individual_effect(effect, card, 'chips', 5)
+    SMODS.calculate_individual_effect({card = joker}, card, 'x_mult', 3)
+else
+    local effects = {effect}
+""" + loop_payload + """
+        hand_chips = mod_chips(hand_chips + effects[ii].chips)
+    end
+    local reps, j = {{jokers = {card = joker, repetitions = 1}}}, 1
+""" + repeat_payload.replace('$statement', 'if reps[j] ~= 1 then') + """
+    end
+""" + loop_payload + """
+        hand_chips = mod_chips(hand_chips + effects[ii].chips)
+    end
+    local _card, edition_effects = joker, {jokers = {x_mult_mod = 3}}
+""" + edition_payload.replace('$statement', 'if edition_effects.jokers.x_mult_mod then') + """
+        mult = mod_mult(mult * edition_effects.jokers.x_mult_mod)
+    end
+end
+check_and_set_high_score('hand', hand_chips * mult)
+local record = G.GAME.run_stats.scoring_hands[1]
+assert(record.sources.base.amount == 20 and record.sources.card_chips.amount == 10)
+assert(record.total == (SMODS and 90 or 120))
+assert(record.sources['joker:999'].amount == (SMODS and 60 or 90))
+print('Scoring patch checks passed: exact baseline, vanilla effect/retrigger/edition hooks and final reconciliation')
+end
 """
 script += f"local boot = assert(loadstring({json.dumps(bootstrap)}))\n"
 script += """

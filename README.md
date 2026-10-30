@@ -18,6 +18,7 @@ PowerBalatro uses flat, dark table rows and disables its own text shadows for re
 ## Pages
 
 - **Summary:** records, run totals, purchases, all five booster pack families, average/median hand scores, and current-deck target chances for The Idol (top four rank/suit combinations) and Castle (suits). Target rows show copies / eligible cards and percentage; Stone cards are excluded, Wild cards use their base suit, and the ante filter does not affect these live deck counts. Steamodded suitless/rankless enhancements are excluded from the appropriate target pools.
+- **Scoring:** one contribution graph per newly played hand, with ante and round selectors. Two hand graphs fit on each page; source paging keeps every owned Joker accessible. Each bar shows attributed score and percentage of the hand's awarded total, including zero-contribution owned Jokers, base hand/planet levels, card +Chips, other card effects, and blind/deck/rounding adjustments. Duplicate Jokers are distinguished by slot.
 - **Trends:** use the View button to cycle through four views:
   - **Overview:** best hand and total round score versus blind targets, hands needed to win, earnings/spending, shop cash reserves, poker hands, and consumable use. Total round score updates during the current blind and is saved when the round ends; older completed rounds without recorded totals appear as gaps in that line.
   - **Analysis:** score consistency and spending categories.
@@ -41,6 +42,8 @@ The shared ante selector offers played antes, skips gaps, and supports endless r
 Stats are saved with the run. The mod does not keep a separate archive after you leave the result screen or start another run.
 
 New metrics begin recording when the relevant mod version is installed. Missing historical data is not reconstructed. Unclassified spending and older pack totals appear under **Other / Earlier**.
+
+Scoring attribution follows the actual evaluation order: each applied effect receives the change in chips × mult at that point, so a multiplier receives the additional score it creates. Intrinsic card scoring from Joker retriggers is assigned to the triggering Joker when its cause is available. This is an order-dependent attribution of direct scoring effects; setup/enabling effects (such as creating cards or changing which cards score) can have zero direct share. Negative shares are penalties. Contributions sum to the awarded score, with rounding and unclassified adjustments shown separately. Zero-score hands have no defined percentage. Nonstandard scoring formulas and values outside the supported numeric range are explicitly marked unsupported; scoring effects are never replayed and no extra random rolls are made.
 
 Income separates blind rewards, unused-hand rewards, interest, Jokers, Cards, sales, and Other, each with a distinct colour. Jokers includes direct joker effects and end-of-round bonuses. Cards includes playing-card effects (such as Lucky/Gold cards and Gold seals) and money-producing consumables. Sales remains separate. Payout components are credited when cash-out is claimed, to the ante of the blind that earned them. Other includes tag/discard rewards, unclassified income, and older income without a recorded source. Adjusted payouts that cannot be split reliably are also kept under Other.
 
