@@ -31,6 +31,8 @@ Shop History uses a single column and shows each card's edition (Base, Foil, Hol
 
 The Shop tab shows observed Joker edition rates, including counts and percentages for Foil, Holographic, Polychrome, and Negative. A separate playing-card field appears with Magic Trick or its Illusion upgrade. Rates use all recorded offers in the selected antes, including rerolls and purchased cards, and count each stock offer once. Offers with missing edition data are explicitly excluded from the denominator. These are observed appearance rates, rather than the game's theoretical edition odds.
 
+Reroll efficiency shows stock refreshes per dollar spent on rerolls, with the number of refreshes, money spent, free refreshes, and total stock rows seen. Free rerolls count as refreshes; opening stock does not increase the efficiency numerator. A run with only free refreshes displays $0 spent rather than a numerical ratio. Costs are paired with their generated stock and follow the ante filter. Earlier rerolls without saved costs are excluded and labeled separately.
+
 The shared ante selector offers played antes, skips gaps, and supports endless runs beyond ante 8. Select **All** to show the whole run. An asterisk marks an ante in progress or partial score history.
 
 ## Tracking behavior

@@ -464,6 +464,13 @@ function RS.record_spend(category, amount)
     if type(amount) ~= 'number' or amount <= 0 then return end
     local bucket = RS.pa()
     if not bucket then return end
+    if category == 'rerolls' then
+        local stats = RS.stats()
+        local pending = stats.reroll_charge
+        local round = G.GAME.round or 0
+        stats.reroll_charge = {round = round, amount = amount
+            + (pending and pending.round == round and pending.amount or 0)}
+    end
     bucket.spending = bucket.spending or {}
     bump(bucket.spending, category, amount)
 end
@@ -967,6 +974,15 @@ function RS.begin_shop_stock(reroll)
     local group = {visit = key, ante = ante, label = label,
         reroll = reroll and last and last.visit == key and last.reroll + 1 or (reroll and 1 or 0),
         capacity = (G.GAME.shop or {}).joker_max or 2, cards = {}}
+    if reroll then
+        -- Pair the successful charge with its new stock, before the game
+        -- recalculates the price of the next reroll. Missing older costs stay nil.
+        local charge = stats.reroll_charge
+        local displayed_cost = (G.GAME.current_round or {}).reroll_cost
+        if charge and charge.round == (G.GAME.round or 0) then group.reroll_cost = charge.amount
+        elseif type(displayed_cost) == 'number' and displayed_cost <= 0 then group.reroll_cost = 0 end
+        stats.reroll_charge = nil
+    end
     stats.shop_stock[#stats.shop_stock + 1] = group
     return group
 end
@@ -3119,6 +3135,26 @@ function RS.show_playing_edition_rates()
     return not not (vouchers.v_magic_trick or vouchers.v_illusion)
 end
 
+function RS.reroll_efficiency()
+    local result = {shops_seen = 0, opening_stocks = 0, rerolls = 0, tracked_rerolls = 0, free_rerolls = 0,
+        spent = 0, unknown_costs = 0}
+    for _, group in ipairs((RS.stats() or {}).shop_stock or {}) do
+        if RS.in_slice(group.ante) and #group.cards > 0 then
+            result.shops_seen = result.shops_seen + 1
+            if (group.reroll or 0) > 0 then
+                result.rerolls = result.rerolls + 1
+                if type(group.reroll_cost) == 'number' and group.reroll_cost >= 0 then
+                    result.tracked_rerolls = result.tracked_rerolls + 1
+                    result.spent = result.spent + group.reroll_cost
+                    if group.reroll_cost == 0 then result.free_rerolls = result.free_rerolls + 1 end
+                else result.unknown_costs = result.unknown_costs + 1 end
+            else result.opening_stocks = result.opening_stocks + 1 end
+        end
+    end
+    result.refreshes_per_dollar = result.spent > 0 and result.tracked_rerolls / result.spent or nil
+    return result
+end
+
 function RS.voucher_history_pages()
     local history, antes, pages, page = (RS.stats() or {}).shop_vouchers or {}, {}, {}, {}
     for ante in pairs(history) do if RS.in_slice(ante) then antes[#antes + 1] = ante end end
@@ -3201,10 +3237,29 @@ local function shop_edition_fields()
     return {n = G.UIT.R, config = {align = 'cm', padding = 0.035}, nodes = fields}
 end
 
+local function reroll_efficiency_field()
+    local data = RS.reroll_efficiency()
+    local label
+    if data.refreshes_per_dollar then label = string.format('Reroll efficiency: %.2f stock refreshes per $1', data.refreshes_per_dollar)
+    elseif data.tracked_rerolls > 0 then label = 'Reroll efficiency: Free refreshes only ($0 spent)'
+    else label = 'Reroll efficiency: No cost-tracked refreshes yet' end
+    local nodes = {
+        shop_text(label, G.C.UI.TEXT_LIGHT, 0.25, 0.01, 'cm'),
+        shop_text(data.tracked_rerolls .. ' refreshes / $' .. number_format(data.spent) .. ' spent   |   '
+            .. data.free_rerolls .. ' free   |   ' .. data.shops_seen .. ' stock rows seen', G.C.UI.TEXT_LIGHT, 0.22, 0.01, 'cm'),
+    }
+    if data.unknown_costs > 0 then
+        nodes[#nodes + 1] = shop_text(data.unknown_costs .. ' earlier rerolls excluded (cost not recorded)', G.C.UI.TEXT_LIGHT, 0.19, 0.005, 'cm')
+    end
+    return {n = G.UIT.R, config = {align = 'cm', padding = 0.025}, nodes = {
+        {n = G.UIT.C, config = {align = 'cm', minw = 9, padding = 0.02, colour = G.C.BLACK, r = 0.1}, nodes = nodes},
+    }}
+end
+
 local function shop_tab()
     local controls = {UIBox_button{label = {'View: ' .. (({history = 'History', frequency = 'Top 5 Seen', vouchers = 'Vouchers'})[RS._shop_view] or 'History')},
         button = 'runstats_shop_view', col = true, minw = 3, minh = 0.4, scale = 0.3, colour = G.C.BLUE}}
-    local contents = {{n = G.UIT.R, config = {align = 'cm', padding = 0.04}, nodes = controls}, shop_edition_fields()}
+    local contents = {{n = G.UIT.R, config = {align = 'cm', padding = 0.04}, nodes = controls}, shop_edition_fields(), reroll_efficiency_field()}
     if RS._shop_view == 'frequency' then
         local categories, valid = RS.shop_categories(), false
         for _, category in ipairs(categories) do if category == RS._shop_category then valid = true end end

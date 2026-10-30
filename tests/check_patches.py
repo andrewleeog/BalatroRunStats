@@ -84,6 +84,8 @@ script += """
 local values, total = RS.spending_summary()
 assert(total == 26 and values.jokers == 7 and values.rerolls == 4 and values.packs == 5 and values.vouchers == 10 and values.other == 0)
 print('Lovely patch checks passed: vanilla and installed source targets, Lua compilation and exact charge payloads')
+local stock = RS.begin_shop_stock(true)
+assert(stock.reroll_cost == 4, 'successful charge payload must pair the paid cost with the new stock')
 """
 income_patches = [p for p in patches if 'prepare_cashout_income' in p['payload'] or "prepare_income('sales'" in p['payload']]
 script += """

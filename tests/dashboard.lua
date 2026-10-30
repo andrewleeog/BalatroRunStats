@@ -1380,6 +1380,65 @@ G.GAME.run_stats.shop_stock = {{ante = 1, label = '1S', visit = '1:1', reroll = 
     cards = {edition_offer('Joker', nil, 'Unknown Joker')}}}
 assert(RS.shop_edition_rates('Joker').rate == nil, 'unknown editions cannot masquerade as Base or zero probability')
 RS.show_menu()
+s = fresh()
+G.shop_jokers, G.shop_vouchers = area(), nil
+G.GAME.shop = {joker_max = 2}
+G.GAME.current_round.reroll_cost = 5
+stock({offer('Joker', 'j_start', 'Opening Joker'), offer('Tarot', 'c_fool', 'The Fool')}, false)
+local efficiency = RS.reroll_efficiency()
+assert(efficiency.shops_seen == 1 and efficiency.rerolls == 0 and efficiency.refreshes_per_dollar == nil)
+-- The charge is observed before the event that generates new stock. A changed
+-- displayed price must not replace the amount that was actually charged.
+RS.record_spend('rerolls', 5)
+G.GAME.current_round.reroll_cost = 99
+stock({offer('Joker', 'j_paid', 'Paid Joker'), offer('Planet', 'c_pluto', 'Pluto')}, true)
+assert(s.shop_stock[2].reroll_cost == 5 and not s.reroll_charge)
+efficiency = RS.reroll_efficiency()
+assert(efficiency.rerolls == 1 and efficiency.spent == 5 and efficiency.refreshes_per_dollar == 0.2)
+G.GAME.current_round.reroll_cost = 0
+stock({offer('Joker', 'j_free', 'Free Joker')}, true)
+efficiency = RS.reroll_efficiency()
+assert(efficiency.tracked_rerolls == 2 and efficiency.free_rerolls == 1 and efficiency.spent == 5 and efficiency.refreshes_per_dollar == 0.4)
+RS.capture_shop_stock(); RS.begin_shop_stock(false)
+assert(RS.reroll_efficiency().rerolls == 2, 'reopening or polling stock cannot create refreshes')
+s.blinds, s.current_blind = {{ante = 1, label = '1BOSS', completed = true}}, 1
+G.GAME.round_resets.ante = 2
+RS.record_spend('rerolls', 2)
+stock({offer('Joker', 'j_discount', 'Discounted Joker')}, true)
+RS._ante_sel = 1
+assert(RS.reroll_efficiency().spent == 7 and RS.reroll_efficiency().tracked_rerolls == 3)
+RS._ante_sel = 2
+assert(RS.reroll_efficiency().tracked_rerolls == 0, 'source-ante stock costs must not leak into the next ante')
+s.blinds[2], s.current_blind = {ante = 2, label = '2S', completed = true}, 2
+G.GAME.round = 2
+stock({offer('Joker', 'j_next', 'Next Opening Joker')}, false)
+RS.record_spend('rerolls', 1)
+stock({offer('Joker', 'j_one', 'One Dollar Joker')}, true)
+assert(RS.reroll_efficiency().refreshes_per_dollar == 1)
+RS._ante_sel = 0
+efficiency = RS.reroll_efficiency()
+assert(efficiency.opening_stocks == 2 and efficiency.rerolls == 4 and efficiency.spent == 8 and efficiency.refreshes_per_dollar == 0.5)
+-- A paid-looking reroll with no recorded charge is unknown, not a fake free roll.
+G.GAME.current_round.reroll_cost = 9
+stock({offer('Joker', 'j_older', 'Unpriced Joker')}, true)
+efficiency = RS.reroll_efficiency()
+assert(efficiency.rerolls == 5 and efficiency.tracked_rerolls == 4 and efficiency.unknown_costs == 1 and efficiency.free_rerolls == 1)
+assert(efficiency.spent == 8 and efficiency.refreshes_per_dollar == 0.5)
+G.GAME.run_stats = copy(s); s = G.GAME.run_stats
+assert(RS.reroll_efficiency().spent == 8, 'refresh costs persist with the run')
+RS._shop_view = 'history'; G.FUNCS.runstats_tab_shop()
+menu_text = {}; gather_text(G.last_overlay)
+assert(menu_text['Reroll efficiency: 0.50 stock refreshes per $1'])
+local saved_stock = s.shop_stock
+s.shop_stock = {{ante = 1, reroll = 1, reroll_cost = 0, cards = {edition_offer('Joker', 'base', 'Free Joker')}}}
+efficiency = RS.reroll_efficiency()
+assert(efficiency.free_rerolls == 1 and efficiency.spent == 0 and efficiency.refreshes_per_dollar == nil)
+RS.show_menu(); menu_text = {}; gather_text(G.last_overlay)
+assert(menu_text['Reroll efficiency: Free refreshes only ($0 spent)'])
+s.shop_stock = nil
+assert(RS.reroll_efficiency().shops_seen == 0)
+s.shop_stock = saved_stock
+print('Reroll efficiency passed: paired charges, free/discounted refreshes, opening-stock exclusion, no duplicates, source antes, unknown costs and saves')
 print('Shop edition rates passed: separate Joker/playing samples, edition breakdowns, voucher gating, ante filters, full history, unknown data, modded editions and saves')
 print('Consumables checks passed: four charts, renamed tabs, individual/type totals, hook returns, ante filters, colors, independent paging, saves and older history')
 print('Detailed income checks passed: exact Joker/card sources, Lucky + Gold Seal splits, unchanged RNG, sales, cash-out attribution, old saves, total reconciliation, paging and rendering')
