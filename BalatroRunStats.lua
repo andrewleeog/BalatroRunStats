@@ -44,6 +44,7 @@ local PA_DEFAULTS = {
     usage_drawn = {},
     usage_played = {},
     income = {},
+    income_details = {},
 }
 
 local function new_pa()
@@ -295,13 +296,32 @@ function RS.card_income_category(card)
     return card and (card.ability or {}).set == 'Joker' and 'jokers' or 'cards'
 end
 
-function RS.with_card_income(card, fn, ...)
+local function income_source(card)
+    local category = RS.card_income_category(card)
+    local config, ability = (card or {}).config or {}, (card or {}).ability or {}
+    local center = config.center or {}
+    local key, set = config.center_key or center.key, ability.set or center.set
+    local name = ability.name
+    if key and set and G.localization and ((G.localization.descriptions or {})[set] or {})[key] then
+        name = localize{type = 'name_text', set = set, key = key}
+    end
+    if name == 'Lucky Card' then name = 'Lucky Cards' end
+    if name == 'Gold Card' then name = 'Gold Cards' end
+    name = name or (category == 'jokers' and 'Jokers (unclassified)' or 'Card effects (unclassified)')
+    return {id = category .. ':' .. (key or name), name = name, category = category}
+end
+
+local function with_income_scope(category, sources, fn, ...)
     local thread = income_thread()
     local previous = income_scopes[thread]
-    income_scopes[thread] = {stats = RS.stats(), category = RS.card_income_category(card)}
+    income_scopes[thread] = {stats = RS.stats(), category = category, sources = sources}
     local result = pack_results(fn(...))
     income_scopes[thread] = previous
     return unpack(result, 1, result.n)
+end
+
+function RS.with_card_income(card, fn, ...)
+    return with_income_scope(RS.card_income_category(card), {income_source(card)}, fn, ...)
 end
 
 function RS.with_effect_income(effect, fn, ...)
@@ -309,11 +329,93 @@ function RS.with_effect_income(effect, fn, ...)
     return RS.with_card_income(effect.card or effect.juice_card or effect.focus, fn, ...)
 end
 
+function RS.with_payment_income(effect, scored_card, key, fn, ...)
+    effect = effect or {}
+    local card = effect.card or effect.juice_card or effect.focus or scored_card
+    local parts = (effect._runstats_income_parts or {})[key]
+    return with_income_scope(parts and 'cards' or RS.card_income_category(card), parts or {income_source(card)}, fn, ...)
+end
+
+-- Observe the existing result, never re-evaluate a Lucky roll. Keep the split
+-- on its returned effect so previews and later evaluations cannot consume it.
+local income_evaluations = setmetatable({}, {__mode = 'k'})
+safe_wrap(Card, 'get_p_dollars', function(ref)
+    return function(self, ...)
+        local evaluation = income_evaluations[income_thread()]
+        if not evaluation or evaluation.card ~= self then return ref(self, ...) end
+        local result = pack_results(ref(self, ...))
+        local amount = result[1]
+        if type(amount) == 'number' and amount > 0 then
+            local ability, parts, remaining = self.ability or {}, {}, amount
+            local seal = (G.P_SEALS or {})[self.seal] or {}
+            local custom_seal = type(seal.get_p_dollars) == 'function'
+            local gold = self.seal == 'Gold' and not ability.extra_enhancement and not custom_seal and not self.debuff
+            local permanent = not ability.extra_enhancement and math.max(0, ability.perma_p_dollars or 0) or 0
+            if not custom_seal and remaining >= (gold and 3 or 0) + permanent then
+                if gold then
+                    parts[#parts + 1] = {id = 'seal:Gold', name = 'Gold Seals', category = 'cards', amount = 3}
+                    remaining = remaining - 3
+                end
+                if permanent > 0 then
+                    parts[#parts + 1] = {id = 'cards:permanent', name = 'Permanent card bonuses', category = 'cards', amount = permanent}
+                    remaining = remaining - permanent
+                end
+                if remaining > 0 then local source = income_source(self); source.amount = remaining; parts[#parts + 1] = source end
+            else
+                parts[1] = {id = 'cards:mixed', name = 'Card effects (mixed)', category = 'cards', amount = amount}
+            end
+            evaluation.parts, evaluation.amount = parts, amount
+        end
+        return unpack(result, 1, result.n)
+    end
+end)
+safe_wrap(_G, 'eval_card', function(ref)
+    return function(card, context, ...)
+        if not context or context.cardarea ~= G.play or context.repetition or context.repetition_only or context.individual then
+            return ref(card, context, ...)
+        end
+        local thread = income_thread()
+        local previous = income_evaluations[thread]
+        local evaluation = {card = card}
+        income_evaluations[thread] = evaluation
+        local result = pack_results(ref(card, context, ...))
+        income_evaluations[thread] = previous
+        local effect = type(result[1]) == 'table' and (result[1].playing_card or result[1])
+        if effect and evaluation.parts and effect.p_dollars == evaluation.amount then
+            effect._runstats_income_parts = {p_dollars = evaluation.parts}
+        end
+        return unpack(result, 1, result.n)
+    end
+end)
+
+local INCOME_LABELS = {blinds = 'Blind rewards', hands = 'Unused hands', interest = 'Interest',
+    sales = 'Sales', jokers = 'Jokers (unclassified)', cards = 'Card effects (unclassified)'}
+local function generic_income_source(category)
+    return {id = category, name = INCOME_LABELS[category] or 'Other / unclassified', category = category}
+end
+local function record_income_detail(bucket, sources, amount, category)
+    bucket.income_details = bucket.income_details or {}
+    local total, split = 0, sources and #sources > 0
+    for _, source in ipairs(sources or {}) do
+        if source.amount then total = total + source.amount else split = false end
+    end
+    if split and math.abs(total - amount) > 0.000001 then
+        sources = {{id = category .. ':mixed', name = (category == 'cards' and 'Card' or 'Income') .. ' effects (mixed)', category = category}}
+        split = false
+    end
+    sources = sources or {generic_income_source(category)}
+    for _, source in ipairs(sources) do
+        local value = split and source.amount or amount
+        local row = bucket.income_details[source.id]
+        if not row then row = {name = source.name, category = source.category, amount = 0}; bucket.income_details[source.id] = row end
+        row.amount = row.amount + value
+    end
+end
+
 safe_wrap(SMODS, 'calculate_individual_effect', function(ref)
     return function(effect, scored_card, key, amount, ...)
         if key == 'dollars' or key == 'p_dollars' or key == 'h_dollars' then
-            local source = effect and (effect.card or effect.juice_card or effect.focus) or nil
-            return RS.with_card_income(source or scored_card, ref, effect, scored_card, key, amount, ...)
+            return RS.with_payment_income(effect, scored_card, key, ref, effect, scored_card, key, amount, ...)
         end
         return ref(effect, scored_card, key, amount, ...)
     end
@@ -442,7 +544,7 @@ end)
 safe_wrap(G.FUNCS, 'evaluate_round', function(ref)
     return function(...)
         local stats = RS.stats()
-        if stats then stats.round_income = { ante = snapshot_ante() or current_ante(), categories = {} } end
+        if stats then stats.round_income = { ante = snapshot_ante() or current_ante(), categories = {}, details = {} } end
         local result = ref(...)
         return result
     end
@@ -456,7 +558,14 @@ safe_wrap(_G, 'add_round_eval_row', function(ref)
             local category = ({blind1 = 'blinds', hands = 'hands', interest = 'interest'})[config.name]
             if not category and config.card then category = RS.card_income_category(config.card) end
             if not category and type(config.name) == 'string' and config.name:match('^joker%d+$') then category = 'jokers' end
-            if category then bump(payout.categories, category, config.dollars) end
+            if category then
+                bump(payout.categories, category, config.dollars)
+                payout.details = payout.details or {}
+                local source = config.card and income_source(config.card) or generic_income_source(category)
+                local row = payout.details[source.id]
+                if not row then row = {name = source.name, category = category, amount = 0}; payout.details[source.id] = row end
+                row.amount = row.amount + config.dollars
+            end
         end
         return ref(config, ...)
     end
@@ -471,9 +580,13 @@ function RS.prepare_cashout_income()
     end
 end
 
-function RS.prepare_income(category)
+function RS.prepare_income(category, card)
     local stats = RS.stats()
-    if stats then RS._next_income = {stats = stats, category = category} end
+    if stats then
+        local source = card and income_source(card) or generic_income_source(category)
+        if card and category == 'sales' then source = {id = 'sale:' .. source.id, name = 'Sale: ' .. source.name, category = 'sales'} end
+        RS._next_income = {stats = stats, category = category, sources = {source}}
+    end
 end
 
 function RS.record_income(category, amount)
@@ -740,6 +853,9 @@ safe_wrap(_G, 'ease_dollars', function(ref)
                 if known <= mod then
                     pa.income = pa.income or {}
                     for category, value in pairs(payout.categories) do bump(pa.income, category, value) end
+                    for id, source in pairs(payout.details or {}) do
+                        record_income_detail(pa, {{id = id, name = source.name, category = source.category}}, source.amount, source.category)
+                    end
                 end
             else
                 pa = RS.pa() or new_pa()
@@ -748,6 +864,11 @@ safe_wrap(_G, 'ease_dollars', function(ref)
                     local category = pending and pending.stats == s and pending.category
                         or (scope and scope.stats == s and scope.category)
                     if category then pa.income = pa.income or {}; bump(pa.income, category, mod) end
+                    if category then
+                    local sources = pending and pending.stats == s and pending.sources
+                            or ((not pending or pending.stats ~= s) and scope and scope.stats == s and scope.sources)
+                        record_income_detail(pa, sources, mod, category)
+                    end
                 end
             end
             if mod < 0 then
@@ -1204,7 +1325,7 @@ function RSChart:draw()
     end
     local horizontal = cfg.kind == 'horizontal'
     local stacked = cfg.kind == 'stacked'
-    local left, right, top, bottom = horizontal and 1.45 or 0.58, 0.2, 0.32, 0.3
+    local left, right, top, bottom = horizontal and (data.label_width or 1.45) or 0.58, 0.2, 0.32, 0.3
     local legend_scale, legend_step, legend_rows, legend_widest = 0.18, 0.15, 1, 0
     repeat
         local legend_x = 0.08
@@ -1272,7 +1393,12 @@ function RSChart:draw()
         for i, label in ipairs(labels) do
             local value = series[1].values[i] or 0
             local cy = top + (i - 1) * slot
-            self:_text(tostring(label), 0.06, cy, math.min(0.19, slot * 1.05), {1, 1, 1, 0.85})
+            local label_scale = math.min(0.19, slot * 1.05)
+            if data.label_width then
+                local width = self.font.FONT:getWidth(tostring(label)) * self.font.FONTSCALE / G.TILESIZE
+                label_scale = math.min(label_scale, (left - 0.16) / math.max(0.001, width))
+            end
+            self:_text(tostring(label), 0.06, cy, label_scale, {1, 1, 1, 0.85})
             graphics.setColor((data.colours or {})[i] or series[1].colour)
             local width = value / maxv * (pw - 0.3)
             if value > 0 then graphics.rectangle('fill', left, cy + slot * 0.15, width, slot * 0.65) end
@@ -1641,13 +1767,16 @@ function RS.rebuild_sliceview()
     v.losses = number_format(RS.career_sliced('c_losses'))
 end
 
--- Value cells bound to the live view-model (native black-pill styling kept)
+-- Flat, dark rows keep small text legible across UI scales and themed installs.
+local TABLE_ROW_COLOUR = {0.12, 0.16, 0.19, 1}
+
+-- Value cells bound to the live view-model.
 local function native_row(label, key, value_colour)
-    return { n = G.UIT.R, config = { align = 'cm', padding = 0.03, r = 0.1, colour = darken(G.C.JOKER_GREY, 0.1), emboss = 0.05 }, nodes = {
+    return { n = G.UIT.R, config = { align = 'cm', padding = 0.03, r = 0.1, colour = TABLE_ROW_COLOUR }, nodes = {
         { n = G.UIT.C, config = { align = 'cl', padding = 0.03, minw = 1.35, maxw = 1.35 }, nodes = {
             { n = G.UIT.T, config = { text = label, scale = 0.27, colour = G.C.UI.TEXT_LIGHT, shadow = true } },
         } },
-        { n = G.UIT.C, config = { align = 'cl', minh = 0.34, r = 0.1, minw = 1.5, colour = G.C.BLACK, emboss = 0.05 }, nodes = {
+        { n = G.UIT.C, config = { align = 'cl', minh = 0.34, r = 0.1, minw = 1.5, colour = G.C.BLACK }, nodes = {
             { n = G.UIT.C, config = { align = 'cm', padding = 0.03, r = 0.1, minw = 1.5, maxw = 1.5 }, nodes = {
                 { n = G.UIT.T, config = { ref_table = RS._sliceview, ref_value = key,
                     scale = 0.26, colour = value_colour or G.C.FILTER, shadow = true } },
@@ -1657,7 +1786,7 @@ local function native_row(label, key, value_colour)
 end
 
 local function text_row(label, key)
-    return { n = G.UIT.R, config = { align = 'cm', padding = 0.025, r = 0.1, colour = darken(G.C.JOKER_GREY, 0.1), emboss = 0.05 }, nodes = {
+    return { n = G.UIT.R, config = { align = 'cm', padding = 0.025, r = 0.1, colour = TABLE_ROW_COLOUR }, nodes = {
         { n = G.UIT.C, config = { align = 'cl', padding = 0.04, minw = 1.35, maxw = 1.35 }, nodes = {
             { n = G.UIT.T, config = { text = label, scale = 0.25, colour = G.C.UI.TEXT_LIGHT, shadow = true } },
         } },
@@ -2063,6 +2192,66 @@ function RS.income_chart_data()
     return {antes = labels, series = series, empty = 'Receive income to start tracking'}
 end
 
+RS._income_detail, RS._income_detail_page = false, 1
+function RS.detailed_income_rows()
+    local totals = {}
+    local function add(id, name, category, amount)
+        if amount <= 0 then return end
+        local row = totals[id]
+        if not row then row = {id = id, name = name, category = category, amount = 0}; totals[id] = row end
+        row.amount = row.amount + amount
+    end
+    for _, entry in ipairs(pa_list()) do
+        if RS.in_slice(entry.ante) then
+            local bucket, budgets, known = entry.bucket, {}, 0
+            for _, category in ipairs(INCOME_CATEGORIES) do
+                if category.key ~= 'other' then
+                    budgets[category.key] = (bucket.income or {})[category.key] or 0
+                    known = known + budgets[category.key]
+                end
+            end
+            budgets.other = math.max(0, (bucket.earned or 0) - known)
+            local ids = {}
+            for id in pairs(bucket.income_details or {}) do ids[#ids + 1] = id end
+            table.sort(ids)
+            for _, id in ipairs(ids) do
+                local row = bucket.income_details[id]
+                local amount = math.min(math.max(0, row.amount or 0), budgets[row.category] or 0)
+                add(id, row.name, row.category, amount)
+                budgets[row.category] = (budgets[row.category] or 0) - amount
+            end
+            for _, category in ipairs(INCOME_CATEGORIES) do
+                add('earlier:' .. category.key, category.key == 'other' and 'Other / unclassified'
+                    or (category.label .. ' (earlier/unclassified)'), category.key, budgets[category.key] or 0)
+            end
+        end
+    end
+    local rows = {}
+    for _, row in pairs(totals) do rows[#rows + 1] = row end
+    table.sort(rows, function(a, b)
+        if a.amount ~= b.amount then return a.amount > b.amount end
+        if a.name ~= b.name then return a.name < b.name end
+        return a.id < b.id
+    end)
+    return rows
+end
+
+function RS.income_detail_chart_data()
+    local rows, labels, values, colours = RS.detailed_income_rows(), {}, {}, {}
+    local pages = math.max(1, math.ceil(#rows / 8))
+    RS._income_detail_page = math.max(1, math.min(RS._income_detail_page or 1, pages))
+    for i = (RS._income_detail_page - 1) * 8 + 1, math.min(RS._income_detail_page * 8, #rows) do
+        local row, hash = rows[i], 0
+        for j = 1, #row.id do hash = (hash * 31 + row.id:byte(j)) % 65521 end
+        local hue = (hash % 360) * math.pi / 180
+        labels[#labels + 1], values[#values + 1] = row.name, row.amount
+        colours[#colours + 1] = {0.58 + 0.28 * math.cos(hue), 0.58 + 0.28 * math.cos(hue + 2.094),
+            0.58 + 0.28 * math.cos(hue + 4.189), 1}
+    end
+    return {antes = labels, series = {series_of('Income ($)', G.C.MONEY, values)}, colours = colours,
+        label_width = 2.9, pages = pages, empty = 'Receive income to start tracking'}
+end
+
 local HAND_ORDER = { 'Flush Five', 'Flush House', 'Five of a Kind', 'Straight Flush',
     'Four of a Kind', 'Full House', 'Flush', 'Straight', 'Three of a Kind', 'Two Pair', 'Pair', 'High Card' }
 
@@ -2267,7 +2456,9 @@ end
 
 local function economy_grid()
     return {n = G.UIT.R, config = {align = 'cm'}, nodes = {
-        chart_node('Income Sources by Ante', RS.income_chart_data, {w = 6.4, h = 3.2, kind = 'stacked'}),
+        chart_node(RS._income_detail and 'Income by Exact Source' or 'Income Sources by Ante',
+            RS._income_detail and RS.income_detail_chart_data or RS.income_chart_data,
+            {w = 6.4, h = 3.2, kind = RS._income_detail and 'horizontal' or 'stacked'}),
         chart_node('Poker-Hand Levels by Ante', RS.hand_levels_chart_data, {w = 6.4, h = 3.2, kind = 'line'}),
     }}
 end
@@ -2467,7 +2658,7 @@ end
 -- Row: name | listed odds | success case | measured rate
 local function prob_row(seed)
     local key = 'p_' .. seed
-    return { n = G.UIT.R, config = { align = 'cm', padding = 0.025, r = 0.1, colour = darken(G.C.JOKER_GREY, 0.1), emboss = 0.05 }, nodes = {
+    return { n = G.UIT.R, config = { align = 'cm', padding = 0.025, r = 0.1, colour = TABLE_ROW_COLOUR }, nodes = {
         { n = G.UIT.C, config = { align = 'cl', padding = 0.04, minw = 1.6, maxw = 1.6 }, nodes = {
             { n = G.UIT.T, config = { ref_table = RS._probview, ref_value = key .. '_name',
                 scale = 0.25, colour = G.C.UI.TEXT_LIGHT, shadow = true } },
@@ -2587,7 +2778,35 @@ local function trend_controls()
         nodes[#nodes + 1] = UIBox_button{label = { 'Group: ' .. DECK_MODES[RS._deck_mode or 1] },
             button = 'runstats_deck_mode', minw = 3.4, minh = 0.4, scale = 0.3, colour = G.C.GREEN, col = true}
     end
+    if RS._trend_view == 'economy' then
+        nodes[#nodes + 1] = UIBox_button{label = {'Income: ' .. (RS._income_detail and 'Detailed' or 'Categories')},
+            button = 'runstats_income_detail', minw = 3.2, minh = 0.4, scale = 0.3, colour = G.C.GREEN, col = true}
+        if RS._income_detail then
+            local data = RS.income_detail_chart_data()
+            for _, option in ipairs({{'<', 'runstats_income_previous', RS._income_detail_page > 1},
+                {'>', 'runstats_income_next', RS._income_detail_page < data.pages}}) do
+                nodes[#nodes + 1] = UIBox_button{label = {option[1]}, button = option[3] and option[2] or 'nil',
+                    minw = 0.6, minh = 0.4, scale = 0.3, col = true,
+                    colour = option[3] and G.C.BLUE or G.C.UI.BACKGROUND_INACTIVE}
+            end
+            nodes[#nodes + 1] = {n = G.UIT.T, config = {text = RS._income_detail_page .. ' / ' .. data.pages,
+                scale = 0.24, colour = G.C.UI.TEXT_LIGHT}}
+        end
+    end
     return {n = G.UIT.R, config = {align = 'cm', padding = 0.04}, nodes = nodes}
+end
+
+G.FUNCS.runstats_income_detail = function()
+    RS._income_detail, RS._income_detail_page = not RS._income_detail, 1
+    RS.show_menu()
+end
+G.FUNCS.runstats_income_next = function()
+    RS._income_detail_page = math.min(RS._income_detail_page + 1, RS.income_detail_chart_data().pages)
+    RS.show_menu()
+end
+G.FUNCS.runstats_income_previous = function()
+    RS._income_detail_page = math.max(1, RS._income_detail_page - 1)
+    RS.show_menu()
 end
 
 G.FUNCS.runstats_return_to_result = function()
@@ -2942,6 +3161,18 @@ G.FUNCS.runstats_ante_reset = function(e)
     RS.show_menu()
 end
 
+-- Limit readability adjustments to this menu's text definitions. Do not mutate
+-- shared colours, game-wide rendering, or the native button/panel shadows.
+local function style_runstats_text(node)
+    if type(node) ~= 'table' then return end
+    if node.n == G.UIT.T and node.config then
+        node.config.shadow = false
+        if node.config.colour == G.C.UI.TEXT_DARK then node.config.colour = {0.78, 0.83, 0.87, 1} end
+    end
+    for _, child in ipairs(node.nodes or {}) do style_runstats_text(child) end
+    for _, child in ipairs(node.contents or {}) do style_runstats_text(child) end
+end
+
 function create_UIBox_runstats()
     RS.normalize_ante_selection()
     local contents = { tabs_row(), ante_row() }
@@ -2966,7 +3197,9 @@ function create_UIBox_runstats()
                     scale = 0.27, colour = G.C.UI.TEXT_LIGHT, shadow = true}},
             }}
             contents[#contents + 1] = {n = G.UIT.R, config = {align = 'cm', padding = 0.04}, nodes = {
-                {n = G.UIT.T, config = {text = 'Other includes unclassified/earlier income. Levels show latest per-ante snapshots; missing history is blank.',
+                {n = G.UIT.T, config = {text = RS._income_detail
+                    and 'Detailed bars total the selected antes. Earlier source data stays unclassified. Levels show the latest per-ante snapshots.'
+                    or 'Other includes unclassified/earlier income. Levels show latest per-ante snapshots; missing history is blank.',
                     scale = 0.21, colour = G.C.UI.TEXT_LIGHT, shadow = true}},
             }}
         elseif RS._trend_view == 'deck' then
@@ -3003,10 +3236,12 @@ function create_UIBox_runstats()
         for _, row in ipairs(joker_target_columns()) do contents[#contents + 1] = row end
     end
 
-    return create_UIBox_generic_options({
+    local definition = create_UIBox_generic_options({
         full_width = true, contents = contents,
         back_func = RS._return_screen and 'runstats_return_to_result' or 'exit_overlay_menu',
     })
+    style_runstats_text(definition)
+    return definition
 end
 
 G.FUNCS.runstats_open = function(e)

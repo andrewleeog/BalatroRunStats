@@ -10,6 +10,22 @@ Game = {
 Card = {open = function(self)
     if not self.rejected and self.ability.set == 'Booster' then self.opening = true end
 end}
+function Card:get_p_dollars()
+    if self.debuff then return 0 end
+    local ability, total = self.ability or {}, 0
+    if self.seal == 'Gold' and not ability.extra_enhancement then total = total + 3 end
+    if ability.effect == 'Lucky Card' then
+        if pseudorandom('lucky_money') < 1 / 15 then total = total + (ability.p_dollars or 0) end
+    else total = total + (ability.p_dollars or 0) end
+    return total + (not ability.extra_enhancement and (ability.perma_p_dollars or 0) or 0)
+end
+function eval_card(card)
+    if card.test_income then
+        local effect = {p_dollars = Card.get_p_dollars(card)}
+        return SMODS and {playing_card = effect} or effect
+    end
+    return {active = card.test_active}
+end
 CardArea = {}
 function CardArea:remove_card(card)
     card = card or self.cards[#self.cards]
@@ -39,7 +55,6 @@ if SMODS then
     local source = source_file:read('*a'); source_file:close()
     assert(loadstring(assert(source:match('(function SMODS.score_card.-)\nfunction SMODS.calculate_main_scoring'))))()
     assert(loadstring(assert(source:match('(function SMODS.calculate_end_of_round_effects.-)\nfunction SMODS.calculate_destroying_cards'))))()
-    function eval_card(card) return {active = card.test_active} end
     SMODS.calculate_quantum_enhancements = noop
     SMODS.calculate_card_areas = noop
     SMODS.calculate_effect = noop
@@ -1163,6 +1178,83 @@ assert(#voucher_pages == 2 and #voucher_pages[1] == 8 and voucher_pages[1][1].an
 G.FUNCS.runstats_shop_older(); assert(RS._voucher_page == 2)
 G.FUNCS.runstats_shop_newer(); assert(RS._voucher_page == 1)
 G.FUNCS.runstats_shop_view(); assert(RS._shop_view == 'history')
+-- Fine income uses the applied effect and observed money, never another roll.
+s = fresh()
+local ticket = {ability = {set = 'Joker', name = 'Golden Ticket'}, config = {center_key = 'j_ticket'}}
+local mail = {ability = {set = 'Joker', name = 'Mail-In Rebate'}, config = {center_key = 'j_mail'}}
+local lucky = {test_income = true, seal = 'Gold', ability = {set = 'Enhanced', name = 'Lucky Card', effect = 'Lucky Card', p_dollars = 20},
+    config = {center_key = 'm_lucky'}}
+local function pay_effect(effect, card, key, amount)
+    if SMODS then SMODS.calculate_individual_effect(effect, card, key, amount)
+    else RS.with_payment_income(effect, card, key, function() ease_dollars(amount) end) end
+end
+local function own_effect(card)
+    local result = eval_card(card, {cardarea = G.play, main_scoring = true})
+    return result.playing_card or result
+end
+local old_random = random_value
+random_value = 0.01
+local before_rolls = random_calls
+local lucky_effect = own_effect(lucky)
+random_value = 0.9
+local seal_effect = own_effect(lucky)
+assert(random_calls == before_rolls + 2, 'one existing Lucky roll per evaluation')
+assert(lucky_effect.p_dollars == 23 and seal_effect.p_dollars == 3)
+pay_effect(lucky_effect, lucky, 'p_dollars', 23)
+pay_effect(seal_effect, lucky, 'p_dollars', 3)
+assert(random_calls == before_rolls + 2, 'attributing income must not re-roll probabilities')
+random_value = old_random
+pay_effect({card = ticket}, lucky, 'dollars', 4)
+RS.with_card_income(mail, function() ease_dollars(5) end)
+local gold = {ability = {set = 'Enhanced', name = 'Gold Card'}, config = {center_key = 'm_gold'}}
+pay_effect({card = gold}, gold, 'h_dollars', 3)
+local hermit = {ability = {set = 'Tarot', name = 'The Hermit'}, config = {center_key = 'c_hermit'}}
+RS.with_card_income(hermit, function() ease_dollars(12) end)
+RS.with_card_income(ticket, function() RS.prepare_income('sales', ticket); ease_dollars(2) end)
+ease_dollars(7)
+local function detail_totals()
+    local names, total = {}, 0
+    for _, row in ipairs(RS.detailed_income_rows()) do names[row.name] = (names[row.name] or 0) + row.amount; total = total + row.amount end
+    return names, total
+end
+local exact, exact_total = detail_totals()
+assert(exact['Gold Seals'] == 6 and exact['Lucky Cards'] == 20 and exact['Golden Ticket'] == 4 and exact['Mail-In Rebate'] == 5)
+assert(exact['Gold Cards'] == 3 and exact['The Hermit'] == 12 and exact['Sale: Golden Ticket'] == 2)
+assert(exact['Other / unclassified'] == 7 and exact_total == select(2, RS.income_summary()))
+-- Adjusted/mixed payouts are not assigned a fabricated seal/enhancement split.
+pay_effect(lucky_effect, lucky, 'p_dollars', 5)
+assert(select(1, detail_totals())['Card effects (mixed)'] == 5)
+-- Cash-out source detail is credited once, to the blind that earned it.
+G.test_round_rows = {{name = 'blind1', dollars = 5}, {name = 'hands', dollars = 2}, {name = 'interest', dollars = 1},
+    {name = 'joker1', dollars = 8, card = {ability = {set = 'Joker', name = 'Cloud 9'}, config = {center_key = 'j_cloud_9'}}},
+    {name = 'bottom', dollars = 16}}
+G.FUNCS.evaluate_round()
+G.GAME.round_resets.ante = 2
+RS.prepare_cashout_income(); ease_dollars(16)
+RS._ante_sel = 1
+exact, exact_total = detail_totals()
+assert(exact['Cloud 9'] == 8 and exact['Blind rewards'] == 5 and exact['Unused hands'] == 2 and exact.Interest == 1)
+assert(exact_total == select(2, RS.income_summary()))
+G.GAME.run_stats = copy(s); s = G.GAME.run_stats
+assert(select(1, detail_totals())['Gold Seals'] == 6, 'source amounts survive save/load')
+-- Old category data is retained as a residual; no invented historical sources.
+RS.pa().earned, RS.pa().income = 9, {jokers = 6, cards = 3}
+RS.pa().income_details = nil
+RS._ante_sel = 2
+exact, exact_total = detail_totals()
+assert(exact['Jokers (earlier/unclassified)'] == 6 and exact['Cards (earlier/unclassified)'] == 3 and exact_total == 9)
+RS._ante_sel = 0
+RS._tab, RS._trend_view, RS._income_detail = 'dashboard', 'economy', false
+G.FUNCS.runstats_income_detail()
+assert(RS._income_detail and RS.income_detail_chart_data().pages >= 2)
+charts = {}; walk(G.last_overlay)
+assert(charts[1].config.kind == 'horizontal' and charts[1].config.data == RS.income_detail_chart_data)
+RSChart({w = 6.4, h = 3.2, kind = 'horizontal', data = RS.income_detail_chart_data}):draw()
+G.FUNCS.runstats_income_next(); assert(RS._income_detail_page == 2)
+RS._ante_sel = 2
+RS.income_detail_chart_data(); assert(RS._income_detail_page == 1, 'a narrower ante filter clamps pages')
+G.FUNCS.runstats_income_detail(); assert(not RS._income_detail)
+print('Detailed income checks passed: exact Joker/card sources, Lucky + Gold Seal splits, unchanged RNG, sales, cash-out attribution, old saves, total reconciliation, paging and rendering')
 print('Shop checks passed: visits, rerolls, purchases, duplicate offers, Overstock sizes, restored stock, pagination, top five, categories, editions, voucher offers/redemptions and ante filters')
 print('Trigger checks passed: scoring, repetitions, held effects, end-of-round effects, filters, suit shades, saves and rendering')
 print('Joker target checks passed: duplicates, full deck, Wild/Stone cards, empty pools and optional enhancement exclusions')

@@ -85,7 +85,7 @@ local values, total = RS.spending_summary()
 assert(total == 26 and values.jokers == 7 and values.rerolls == 4 and values.packs == 5 and values.vouchers == 10 and values.other == 0)
 print('Lovely patch checks passed: vanilla and installed source targets, Lua compilation and exact charge payloads')
 """
-income_patches = [p for p in patches if 'prepare_cashout_income' in p['payload'] or "prepare_income('sales')" in p['payload']]
+income_patches = [p for p in patches if 'prepare_cashout_income' in p['payload'] or "prepare_income('sales'" in p['payload']]
 script += """
 G.GAME.run_stats = RS.fresh_stats()
 G.GAME.round_resets.ante = 1
@@ -111,7 +111,7 @@ G.GAME.round_resets.ante = 1
 for kind, amount in [('Joker', 9), ('Tarot', 4)]:
     script += f"do local self = {{ability = {{set = '{kind}', extra = {amount}}}}}; " + card_payment.replace('$args', 'self.ability.extra') + " end\n"
 for effect, amount in [("{card = {ability = {set = 'Joker'}}}", 6), ('{}', 3)]:
-    script += f"do local effects = {{{effect}}}; local ii = 1; effects[ii].dollars = {amount}; " + effect_payment.replace('$args', 'effects[ii].dollars') + " end\n"
+    script += f"do local effects = {{{effect}}}; local ii = 1; effects[ii].dollars = {amount}; " + effect_payment.replace('$args', 'effects[ii].dollars').replace('$key', 'dollars') + " end\n"
 script += """
 local income, total = RS.income_summary()
 assert(total == 22 and income.jokers == 15 and income.cards == 7 and income.other == 0)

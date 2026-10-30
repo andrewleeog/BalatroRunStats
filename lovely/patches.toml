@@ -115,7 +115,7 @@ target = "card.lua"
 pattern = "ease_dollars(self.sell_cost)"
 position = "before"
 match_indent = true
-payload = "if RunStats then RunStats.prepare_income('sales') end"
+payload = "if RunStats then RunStats.prepare_income('sales', self) end"
 
 # Run at the actual payment sites, including deferred card/joker callbacks.
 [[patches]]
@@ -131,10 +131,10 @@ payload = "if RunStats then RunStats.with_card_income(self, function() ease_doll
 [[patches]]
 [patches.regex]
 target = "functions/state_events.lua"
-pattern = '(?m)^(?<indent>[\t ]*)ease_dollars\((?<args>effects\[ii\]\.[a-z_]+)\)[\t ]*$'
+pattern = '(?m)^(?<indent>[\t ]*)ease_dollars\((?<args>effects\[ii\]\.(?<key>[a-z_]+))\)[\t ]*$'
 position = "at"
 line_prepend = '$indent'
-payload = "if RunStats then RunStats.with_effect_income(effects[ii], function() ease_dollars($args) end) else ease_dollars($args) end"
+payload = "if RunStats then RunStats.with_payment_income(effects[ii], nil, '$key', function() ease_dollars($args) end) else ease_dollars($args) end"
 
 # Vanilla: one applied scoring pass, after individual Joker effects are gathered.
 # Steamodded replaces these loops and uses the scoped trigger_effects hook.
