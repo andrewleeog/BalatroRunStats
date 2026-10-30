@@ -24,6 +24,7 @@ local PA_DEFAULTS = {
     drawn = 0,
     consumables = 0,
     cset = {},
+    consumables_by_key = {},
     earned = 0,
     spent = 0,
     jokers_bought = 0,
@@ -75,6 +76,7 @@ function RS.fresh_stats()
         money_spent = 0,
         consumables_used = { total = 0, Tarot = 0, Planet = 0, Spectral = 0 },
         consumables_by_key = {},
+        consumable_info = {},
         glass = { destroyed = 0 },
     }
 end
@@ -813,24 +815,33 @@ safe_wrap(Card, 'shatter', function(ref)
     end
 end)
 
+-- Store card identity per ante as well as the older run-wide counters.
+function RS.record_consumable_use(card)
+    local stats = RS.stats()
+    if not stats or not card then return end
+    local config, ability = card.config or {}, card.ability or {}
+    local center = config.center or {}
+    local set = ability.set or center.set
+    if set ~= 'Tarot' and set ~= 'Planet' and set ~= 'Spectral' then return end
+    local key = config.center_key or center.key or ability.name or 'unknown'
+    stats.consumables_used = stats.consumables_used or {total = 0}
+    stats.consumables_used.total = (stats.consumables_used.total or 0) + 1
+    stats.consumables_used[set] = (stats.consumables_used[set] or 0) + 1
+    stats.consumables_by_key = stats.consumables_by_key or {}
+    bump(stats.consumables_by_key, key, 1)
+    stats.consumable_info = stats.consumable_info or {}
+    stats.consumable_info[key] = {set = set, name = ability.name or center.name or key}
+    local bucket = RS.pa()
+    bucket.consumables = (bucket.consumables or 0) + 1
+    bucket.cset, bucket.consumables_by_key = bucket.cset or {}, bucket.consumables_by_key or {}
+    bump(bucket.cset, set, 1)
+    bump(bucket.consumables_by_key, key, 1)
+end
+
 -- Consumable uses (Tarot / Planet / Spectral)
 safe_wrap(Card, 'use_consumeable', function(ref)
     return function(self, area, copier, ...)
-        local s = RS.stats()
-        if s and self.ability then
-            local set = self.ability.set
-            if set == 'Tarot' or set == 'Planet' or set == 'Spectral' then
-                s.consumables_used.total = s.consumables_used.total + 1
-                s.consumables_used[set] = (s.consumables_used[set] or 0) + 1
-                local pa = RS.pa()
-                if pa then
-                    pa.consumables = pa.consumables + 1
-                    pa.cset[set] = (pa.cset[set] or 0) + 1
-                end
-                local key = (self.config and self.config.center_key) or self.ability.name or 'unknown'
-                s.consumables_by_key[key] = (s.consumables_by_key[key] or 0) + 1
-            end
-        end
+        RS.record_consumable_use(self)
         return ref(self, area, copier, ...)
     end
 end)
@@ -2106,6 +2117,121 @@ function RS.consumables_chart_data()
     } }
 end
 
+local CONSUMABLE_SETS = {'Tarot', 'Planet', 'Spectral'}
+local CONSUMABLE_COLOURS = {Tarot = {0.66, 0.43, 0.95, 1}, Planet = {0.18, 0.62, 1, 1}, Spectral = {0.25, 0.82, 0.55, 1}}
+RS._consumable_pages = {All = 1, Tarot = 1, Planet = 1, Spectral = 1}
+
+function RS.consumable_usage()
+    local stats = RS.stats() or {}
+    local counts, totals, rows = {}, {Tarot = 0, Planet = 0, Spectral = 0}, {Tarot = {}, Planet = {}, Spectral = {}}
+    if RS.slice_is_full() then
+        for key, count in pairs(stats.consumables_by_key or {}) do counts[key] = count end
+        for _, set in ipairs(CONSUMABLE_SETS) do totals[set] = (stats.consumables_used or {})[set] or 0 end
+    else
+        for ante, bucket in pairs(stats.per_ante or {}) do
+            if RS.in_slice(ante) then
+                for key, count in pairs(bucket.consumables_by_key or {}) do bump(counts, key, count) end
+                for _, set in ipairs(CONSUMABLE_SETS) do totals[set] = totals[set] + ((bucket.cset or {})[set] or 0) end
+            end
+        end
+    end
+    local known = {Tarot = 0, Planet = 0, Spectral = 0}
+    for key, count in pairs(counts) do
+        local center = (G.P_CENTERS or {})[key]
+        if not center then
+            -- Earlier saves could use the ability name instead of a center key.
+            for _, candidate in pairs(G.P_CENTERS or {}) do if candidate.name == key then center = candidate; break end end
+        end
+        local info = (stats.consumable_info or {})[key] or {}
+        local set = info.set or (center or {}).set
+        if rows[set] and count > 0 then
+            local name = info.name or (center or {}).name or key
+            local center_key = (center or {}).key or key
+            if G.localization and ((G.localization.descriptions or {})[set] or {})[center_key] then
+                name = localize{type = 'name_text', set = set, key = center_key}
+            end
+            rows[set][#rows[set] + 1] = {key = key, name = name, count = count}
+            known[set] = known[set] + count
+        end
+    end
+    for _, set in ipairs(CONSUMABLE_SETS) do
+        if totals[set] > known[set] then rows[set][#rows[set] + 1] = {key = 'unclassified', name = 'Earlier / unclassified', count = totals[set] - known[set]} end
+        totals[set] = math.max(totals[set], known[set])
+        table.sort(rows[set], function(a, b)
+            if a.count ~= b.count then return a.count > b.count end
+            if a.name ~= b.name then return a.name < b.name end
+            return a.key < b.key
+        end)
+    end
+    return {rows = rows, totals = totals, total = totals.Tarot + totals.Planet + totals.Spectral}
+end
+
+function RS.consumable_card_chart_data(set)
+    local usage, labels, values, colours = RS.consumable_usage(), {}, {}, {}
+    local rows = usage.rows[set] or {}
+    if set == 'All' then
+        for _, kind in ipairs(CONSUMABLE_SETS) do
+            for _, row in ipairs(usage.rows[kind]) do
+                rows[#rows + 1] = {key = kind .. ':' .. row.key, name = row.name .. ' (' .. kind .. ')', count = row.count, set = kind}
+            end
+        end
+        table.sort(rows, function(a, b)
+            if a.count ~= b.count then return a.count > b.count end
+            if a.name ~= b.name then return a.name < b.name end
+            return a.key < b.key
+        end)
+    end
+    local pages = math.max(1, math.ceil(#rows / 6))
+    local page = math.max(1, math.min(RS._consumable_pages[set] or 1, pages))
+    RS._consumable_pages[set] = page
+    for i = (page - 1) * 6 + 1, math.min(page * 6, #rows) do
+        labels[#labels + 1], values[#values + 1] = rows[i].name, rows[i].count
+        colours[#colours + 1] = CONSUMABLE_COLOURS[rows[i].set or set]
+    end
+    return {antes = labels, series = {series_of('Times used', CONSUMABLE_COLOURS[set] or G.C.WHITE, values)},
+        colours = colours, label_width = 2.5, total = set == 'All' and usage.total or usage.totals[set], pages = pages,
+        empty = set == 'All' and 'No consumables used in this ante range' or ('No ' .. set .. ' cards used in this ante range')}
+end
+
+function RS.all_consumables_chart_data()
+    return RS.consumable_card_chart_data('All')
+end
+
+for _, set in ipairs({'All', 'Tarot', 'Planet', 'Spectral'}) do
+    for _, direction in ipairs({'previous', 'next'}) do
+        G.FUNCS['runstats_consumables_' .. set:lower() .. '_' .. direction] = function()
+            local data = RS.consumable_card_chart_data(set)
+            RS._consumable_pages[set] = math.max(1, math.min(RS._consumable_pages[set] + (direction == 'next' and 1 or -1), data.pages))
+            RS.show_menu()
+        end
+    end
+end
+
+local function consumables_tab()
+    local function panel(set)
+        local data = RS.consumable_card_chart_data(set)
+        local title = (set == 'All' and 'All Consumables' or (set .. ' Cards')) .. ' - ' .. data.total .. ' used'
+        local definition = chart_node(title, function() return RS.consumable_card_chart_data(set) end,
+            {w = 6.4, h = 2.4, kind = 'horizontal'})
+        local controls = {}
+        if data.pages > 1 then
+            for _, spec in ipairs({{'<', 'previous', RS._consumable_pages[set] > 1}, {'>', 'next', RS._consumable_pages[set] < data.pages}}) do
+                controls[#controls + 1] = UIBox_button{label = {spec[1]},
+                    button = spec[3] and ('runstats_consumables_' .. set:lower() .. '_' .. spec[2]) or 'nil', col = true,
+                    minw = 0.6, minh = 0.3, scale = 0.24, colour = spec[3] and G.C.BLUE or G.C.UI.BACKGROUND_INACTIVE}
+            end
+            controls[#controls + 1] = {n = G.UIT.T, config = {text = RS._consumable_pages[set] .. ' / ' .. data.pages,
+                scale = 0.22, colour = G.C.UI.TEXT_LIGHT}}
+        end
+        definition.nodes[#definition.nodes + 1] = {n = G.UIT.R, config = {align = 'cm', minh = 0.32}, nodes = controls}
+        return definition
+    end
+    return {
+        {n = G.UIT.R, config = {align = 'cm'}, nodes = {panel('All'), panel('Tarot')}},
+        {n = G.UIT.R, config = {align = 'cm'}, nodes = {panel('Planet'), panel('Spectral')}},
+    }
+end
+
 function RS.consistency_chart_data()
     local labels, averages, medians = {}, {}, {}
     local any = false
@@ -2711,7 +2837,7 @@ function RS.rebuild_probview()
 end
 
 -- ------------------------------------------------------------
--- Menu assembly (tabs: Summary | Trends | Probabilities | Cards)
+-- Menu assembly: Summary | Trends | Probabilities | Deck | Consumables | Shop.
 -- ------------------------------------------------------------
 
 RS._tab = 'stats'
@@ -2963,6 +3089,36 @@ function RS.shop_frequency(category)
     return rows
 end
 
+function RS.shop_edition_rates(category)
+    local result = {total = 0, known = 0, unknown = 0, editions = 0,
+        counts = {base = 0, foil = 0, holo = 0, polychrome = 0, negative = 0, other = 0}}
+    for _, group in ipairs((RS.stats() or {}).shop_stock or {}) do
+        if RS.in_slice(group.ante) then
+            for _, offer in ipairs(group.cards) do
+                if offer.category == category then
+                    result.total = result.total + 1
+                    if offer.edition == nil then result.unknown = result.unknown + 1
+                    else
+                        local edition = tostring(offer.edition):lower():gsub('^e_', '')
+                        if edition == 'none' or edition == '' then edition = 'base' end
+                        if result.counts[edition] == nil then edition = 'other' end
+                        result.known = result.known + 1
+                        result.counts[edition] = result.counts[edition] + 1
+                        if edition ~= 'base' then result.editions = result.editions + 1 end
+                    end
+                end
+            end
+        end
+    end
+    result.rate = result.known > 0 and 100 * result.editions / result.known or nil
+    return result
+end
+
+function RS.show_playing_edition_rates()
+    local vouchers = (G.GAME or {}).used_vouchers or {}
+    return not not (vouchers.v_magic_trick or vouchers.v_illusion)
+end
+
 function RS.voucher_history_pages()
     local history, antes, pages, page = (RS.stats() or {}).shop_vouchers or {}, {}, {}, {}
     for ante in pairs(history) do if RS.in_slice(ante) then antes[#antes + 1] = ante end end
@@ -3018,10 +3174,37 @@ local function shop_text(text, colour, scale, padding, align)
     }}
 end
 
+local function shop_edition_fields()
+    local function field(category, title)
+        local data = RS.shop_edition_rates(category)
+        local nodes = {shop_text(title, G.C.UI.TEXT_LIGHT, 0.25, 0.01, 'cm')}
+        if data.known > 0 then
+            nodes[#nodes + 1] = shop_text(string.format('%d / %d offers (%.1f%%)', data.editions, data.known, data.rate),
+                G.C.FILTER, 0.26, 0.01, 'cm')
+            local function rate(key, label)
+                return string.format('%s: %d (%.1f%%)', label, data.counts[key], 100 * data.counts[key] / data.known)
+            end
+            nodes[#nodes + 1] = shop_text(rate('foil', 'Foil') .. '   |   ' .. rate('holo', 'Holo'), G.C.UI.TEXT_LIGHT, 0.20, 0.005, 'cm')
+            nodes[#nodes + 1] = shop_text(rate('polychrome', 'Polychrome') .. '   |   ' .. rate('negative', 'Negative'), G.C.UI.TEXT_LIGHT, 0.20, 0.005, 'cm')
+            if data.counts.other > 0 then nodes[#nodes + 1] = shop_text(rate('other', 'Other editions'), G.C.UI.TEXT_LIGHT, 0.20, 0.005, 'cm') end
+        else
+            nodes[#nodes + 1] = shop_text(data.total == 0 and 'No recorded offers yet' or 'No recorded edition data yet', G.C.UI.TEXT_LIGHT, 0.22, 0.01, 'cm')
+        end
+        if data.unknown > 0 then
+            nodes[#nodes + 1] = shop_text(data.unknown .. (data.unknown == 1 and ' older offer excluded' or ' older offers excluded')
+                .. ' (edition not recorded)', G.C.UI.TEXT_LIGHT, 0.18, 0.005, 'cm')
+        end
+        return {n = G.UIT.C, config = {align = 'cm', minw = 6.25, padding = 0.025, colour = G.C.BLACK, r = 0.1}, nodes = nodes}
+    end
+    local fields = {field('Joker', 'Observed Joker edition rate')}
+    if RS.show_playing_edition_rates() then fields[#fields + 1] = field('Playing', 'Observed playing-card edition rate') end
+    return {n = G.UIT.R, config = {align = 'cm', padding = 0.035}, nodes = fields}
+end
+
 local function shop_tab()
     local controls = {UIBox_button{label = {'View: ' .. (({history = 'History', frequency = 'Top 5 Seen', vouchers = 'Vouchers'})[RS._shop_view] or 'History')},
         button = 'runstats_shop_view', col = true, minw = 3, minh = 0.4, scale = 0.3, colour = G.C.BLUE}}
-    local contents = {{n = G.UIT.R, config = {align = 'cm', padding = 0.04}, nodes = controls}}
+    local contents = {{n = G.UIT.R, config = {align = 'cm', padding = 0.04}, nodes = controls}, shop_edition_fields()}
     if RS._shop_view == 'frequency' then
         local categories, valid = RS.shop_categories(), false
         for _, category in ipairs(categories) do if category == RS._shop_category then valid = true end end
@@ -3091,9 +3274,9 @@ local function tab_button(label, tab_id, tab_key)
     return UIBox_button{
         label = { label },
         button = tab_id,
-        minw = 2.2,
+        minw = math.max(1.3, #label * 0.18 + 0.5),
         minh = 0.5,
-        scale = 0.38,
+        scale = 0.33,
         col = true,
         colour = active and G.C.BLUE or G.C.UI.BACKGROUND_INACTIVE,
         shadow = true,
@@ -3104,8 +3287,9 @@ local function tabs_row()
     return { n = G.UIT.R, config = { align = 'cm', padding = 0.05 }, nodes = {
         tab_button('Summary', 'runstats_tab_stats', 'stats'),
         tab_button('Trends', 'runstats_tab_dash', 'dashboard'),
-        tab_button('Prob', 'runstats_tab_prob', 'probabilities'),
-        tab_button('Cards', 'runstats_tab_cards', 'cards'),
+        tab_button('Probabilities', 'runstats_tab_prob', 'probabilities'),
+        tab_button('Deck', 'runstats_tab_cards', 'cards'),
+        tab_button('Consumables', 'runstats_tab_consumables', 'consumables'),
         tab_button('Shop', 'runstats_tab_shop', 'shop'),
     } }
 end
@@ -3230,6 +3414,8 @@ function create_UIBox_runstats()
         end
     elseif RS._tab == 'shop' then
         for _, row in ipairs(shop_tab()) do contents[#contents + 1] = row end
+    elseif RS._tab == 'consumables' then
+        for _, row in ipairs(consumables_tab()) do contents[#contents + 1] = row end
     else
         local cols = stats_tab_columns()
         contents[#contents + 1] = { n = G.UIT.R, config = { align = 'ct' }, nodes = cols }
@@ -3275,6 +3461,11 @@ G.FUNCS.runstats_tab_shop = function()
     RS._tab = 'shop'
     RS._shop_page = 1
     RS._voucher_page = 1
+    RS.show_menu()
+end
+
+G.FUNCS.runstats_tab_consumables = function()
+    RS._tab = 'consumables'
     RS.show_menu()
 end
 

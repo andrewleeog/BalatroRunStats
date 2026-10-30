@@ -19,6 +19,10 @@ function Card:get_p_dollars()
     else total = total + (ability.p_dollars or 0) end
     return total + (not ability.extra_enhancement and (ability.perma_p_dollars or 0) or 0)
 end
+function Card:use_consumeable(area, copier)
+    self.test_uses = (self.test_uses or 0) + 1
+    return 'used', nil, copier
+end
 function eval_card(card)
     if card.test_income then
         local effect = {p_dollars = Card.get_p_dollars(card)}
@@ -1254,6 +1258,130 @@ G.FUNCS.runstats_income_next(); assert(RS._income_detail_page == 2)
 RS._ante_sel = 2
 RS.income_detail_chart_data(); assert(RS._income_detail_page == 1, 'a narrower ante filter clamps pages')
 G.FUNCS.runstats_income_detail(); assert(not RS._income_detail)
+-- Consumable card counts are per ante, while older run-wide history remains
+-- usable on All. The four charts show every used card through independent pages.
+s = fresh()
+RS._ante_sel = 0
+local saved_centers = G.P_CENTERS
+G.P_CENTERS = {
+    c_sun = {key = 'c_sun', set = 'Tarot', name = 'The Sun'},
+    c_cryptid = {key = 'c_cryptid', set = 'Spectral', name = 'Cryptid'},
+    c_uranus = {key = 'c_uranus', set = 'Planet', name = 'Uranus'},
+}
+local sun = {config = {center_key = 'c_sun'}, ability = {set = 'Tarot', name = 'The Sun'}}
+local cryptid = {config = {center = G.P_CENTERS.c_cryptid}, ability = {set = 'Spectral', name = 'Cryptid'}}
+local uranus = {config = {center_key = 'c_uranus'}, ability = {set = 'Planet', name = 'Uranus'}}
+assert(RS.all_consumables_chart_data().total == 0 and #RS.all_consumables_chart_data().antes == 0)
+local used, missing, copier = Card.use_consumeable(sun, nil, 'kept')
+assert(used == 'used' and missing == nil and copier == 'kept')
+Card.use_consumeable(sun); Card.use_consumeable(cryptid); Card.use_consumeable(uranus)
+G.GAME.round_resets.ante = 2
+Card.use_consumeable(sun); Card.use_consumeable(cryptid); Card.use_consumeable(uranus); Card.use_consumeable(uranus)
+local usage = RS.consumable_usage()
+assert(usage.total == 8 and usage.totals.Tarot == 3 and usage.totals.Spectral == 2 and usage.totals.Planet == 3)
+assert(RS.consumable_card_chart_data('Tarot').antes[1] == 'The Sun' and RS.consumable_card_chart_data('Tarot').series[1].values[1] == 3)
+assert(RS.consumable_card_chart_data('Spectral').antes[1] == 'Cryptid' and RS.consumable_card_chart_data('Spectral').series[1].values[1] == 2)
+assert(RS.consumable_card_chart_data('Planet').antes[1] == 'Uranus' and RS.consumable_card_chart_data('Planet').series[1].values[1] == 3)
+local combined, combined_total, used_colours = RS.all_consumables_chart_data(), 0, {}
+for i, count in ipairs(combined.series[1].values) do combined_total = combined_total + count; used_colours[table.concat(combined.colours[i], ',')] = true end
+local colour_count = 0; for _ in pairs(used_colours) do colour_count = colour_count + 1 end
+assert(combined_total == 8 and colour_count == 3)
+Card.use_consumeable({ability = {set = 'Joker', name = 'Joker'}})
+G.STAGE = G.STAGES.MAIN_MENU
+Card.use_consumeable(sun)
+G.STAGE = G.STAGES.RUN
+assert(s.consumables_used.total == 8, 'only run-scoped Tarot/Planet/Spectral uses are recorded')
+RS._ante_sel = 1
+usage = RS.consumable_usage()
+assert(usage.total == 4 and usage.totals.Tarot == 2 and usage.rows.Tarot[1].count == 2)
+RS._ante_sel = 2
+assert(RS.consumable_usage().totals.Planet == 2)
+RS._ante_sel = 0
+G.FUNCS.runstats_tab_consumables()
+assert(RS._tab == 'consumables')
+local nav_labels, nav_width = {}, 0
+for _, button in ipairs(G.last_overlay.contents[1].nodes) do
+    nav_labels[button.config.label[1]] = true
+    nav_width = nav_width + button.config.minw
+end
+assert(nav_labels.Probabilities and nav_labels.Deck and nav_labels.Consumables and not nav_labels.Prob and not nav_labels.Cards)
+assert(nav_width < 13.4, 'the longer tab names fit the menu width')
+charts = {}; walk(G.last_overlay)
+assert(#charts == 4)
+for _, chart in ipairs(charts) do assert(chart.config.kind == 'horizontal'); chart:draw() end
+for i = 1, 8 do Card.use_consumeable({config = {center_key = 'c_extra_' .. i}, ability = {set = 'Tarot', name = 'Extra Tarot ' .. i}}) end
+assert(RS.consumable_card_chart_data('Tarot').pages == 2 and RS.all_consumables_chart_data().pages == 2)
+G.FUNCS.runstats_consumables_tarot_next()
+assert(RS._consumable_pages.Tarot == 2 and RS._consumable_pages.All == 1)
+G.FUNCS.runstats_consumables_all_next(); assert(RS._consumable_pages.All == 2)
+G.FUNCS.runstats_consumables_all_previous(); assert(RS._consumable_pages.All == 1)
+RS._ante_sel = 1
+RS.consumable_card_chart_data('Tarot'); assert(RS._consumable_pages.Tarot == 1)
+G.GAME.run_stats = copy(s); s = G.GAME.run_stats
+assert(RS.consumable_usage().rows.Tarot[1].count == 2, 'card use history survives save/load')
+s.per_ante[1].consumables_by_key = nil
+usage = RS.consumable_usage()
+assert(usage.rows.Tarot[1].name == 'Earlier / unclassified' and usage.rows.Tarot[1].count == 2)
+RS._ante_sel = 0
+assert(RS.consumable_usage().rows.Tarot[1].name == 'The Sun' and RS.consumable_usage().rows.Tarot[1].count == 3,
+    'All retains existing run-wide card counts even when older ante detail is missing')
+local saved_info = s.consumable_info
+s.consumable_info = nil
+assert(RS.consumable_usage().rows.Spectral[1].name == 'Cryptid', 'older card keys resolve through the game catalog')
+s.consumable_info = saved_info
+G.P_CENTERS = saved_centers
+s = fresh()
+G.shop_jokers, G.shop_vouchers, G.GAME.used_vouchers = nil, nil, {}
+RS._ante_sel = 0
+assert(RS.shop_edition_rates('Joker').rate == nil and RS.shop_edition_rates('Joker').total == 0)
+local function edition_offer(category, edition, name)
+    return {key = name, name = name, category = category, edition = edition, cost = 5}
+end
+s.shop_stock = {
+    {ante = 1, label = '1S', visit = '1:1', reroll = 0, capacity = 4, cards = {
+        edition_offer('Joker', 'base', 'Base Joker'), edition_offer('Joker', 'foil', 'Foil Joker'),
+        edition_offer('Joker', 'holo', 'Holo Joker'), edition_offer('Playing', 'base', 'Base Ace'),
+        edition_offer('Playing', 'polychrome', 'Polychrome Ace'), edition_offer('Tarot', 'foil', 'Foil Tarot')}},
+    {ante = 1, label = '1S', visit = '1:1', reroll = 1, capacity = 2, cards = {
+        edition_offer('Joker', 'negative', 'Negative Joker'), edition_offer('Playing', 'foil', 'Foil King'),
+        edition_offer('Planet', 'negative', 'Negative Planet')}},
+    {ante = 2, label = '2B', visit = '2:2', reroll = 0, capacity = 4, cards = {
+        edition_offer('Joker', 'base', 'Second Base Joker'), edition_offer('Joker', 'polychrome', 'Polychrome Joker'),
+        edition_offer('Joker', nil, 'Older Joker'), edition_offer('Playing', 'base', 'Base Queen')}},
+}
+local joker_rates, playing_rates = RS.shop_edition_rates('Joker'), RS.shop_edition_rates('Playing')
+assert(joker_rates.total == 7 and joker_rates.known == 6 and joker_rates.unknown == 1 and joker_rates.editions == 4)
+assert(math.abs(joker_rates.rate - 100 * 4 / 6) < 0.00001)
+assert(joker_rates.counts.foil == 1 and joker_rates.counts.holo == 1 and joker_rates.counts.polychrome == 1 and joker_rates.counts.negative == 1)
+assert(playing_rates.known == 4 and playing_rates.editions == 2 and playing_rates.rate == 50)
+assert(not RS.show_playing_edition_rates(), 'modded playing-card offers do not bypass the Magic Trick condition')
+RS._shop_view = 'history'; G.FUNCS.runstats_tab_shop()
+menu_text = {}; gather_text(G.last_overlay)
+assert(menu_text['Observed Joker edition rate'] and menu_text['4 / 6 offers (66.7%)'])
+assert(not menu_text['Observed playing-card edition rate'])
+G.GAME.used_vouchers.v_magic_trick = true
+RS.show_menu(); menu_text = {}; gather_text(G.last_overlay)
+assert(menu_text['Observed playing-card edition rate'] and menu_text['2 / 4 offers (50.0%)'])
+assert(menu_text['1 older offer excluded (edition not recorded)'])
+RS._shop_page = 99
+assert(RS.shop_edition_rates('Joker').known == 6, 'rates cover the whole history rather than just the current page')
+RS._ante_sel = 1
+assert(RS.shop_edition_rates('Joker').rate == 75 and RS.shop_edition_rates('Joker').unknown == 0)
+assert(RS.shop_edition_rates('Playing').known == 3)
+RS._ante_sel = 0
+G.GAME.used_vouchers = {v_illusion = true}
+assert(RS.show_playing_edition_rates(), 'Illusion retains the playing-card edition field')
+table.insert(s.shop_stock[3].cards, edition_offer('Joker', 'custom_edition', 'Custom Edition Joker'))
+joker_rates = RS.shop_edition_rates('Joker')
+assert(joker_rates.known == 7 and joker_rates.editions == 5 and joker_rates.counts.other == 1)
+G.GAME.run_stats = copy(s)
+assert(RS.shop_edition_rates('Joker').counts.other == 1, 'edition rates survive save/load')
+G.GAME.run_stats.shop_stock = {{ante = 1, label = '1S', visit = '1:1', reroll = 0, capacity = 2,
+    cards = {edition_offer('Joker', nil, 'Unknown Joker')}}}
+assert(RS.shop_edition_rates('Joker').rate == nil, 'unknown editions cannot masquerade as Base or zero probability')
+RS.show_menu()
+print('Shop edition rates passed: separate Joker/playing samples, edition breakdowns, voucher gating, ante filters, full history, unknown data, modded editions and saves')
+print('Consumables checks passed: four charts, renamed tabs, individual/type totals, hook returns, ante filters, colors, independent paging, saves and older history')
 print('Detailed income checks passed: exact Joker/card sources, Lucky + Gold Seal splits, unchanged RNG, sales, cash-out attribution, old saves, total reconciliation, paging and rendering')
 print('Shop checks passed: visits, rerolls, purchases, duplicate offers, Overstock sizes, restored stock, pagination, top five, categories, editions, voucher offers/redemptions and ante filters')
 print('Trigger checks passed: scoring, repetitions, held effects, end-of-round effects, filters, suit shades, saves and rendering')
